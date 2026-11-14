@@ -10,6 +10,8 @@
 | Transport | P4 <-> C6 | esp_hosted over SDIO | standard HCI commands, events, ACL and ISO data |
 | CIS link layer | ESP32-C6 | `cis_ll` engine + `c6_firmware` adapter | CIG/CIS setup (LL_CIS_REQ/RSP/IND), event scheduling, SDU mapping and jitter buffer, CCM, flush timeout, NOCP |
 | BLE controller | ESP32-C6 | Espressif `libble_app.a` (stock) | advertising, scanning, ACL connections, LLCP, encryption; hooked for CIS events |
+| Classic host (optional) | ESP32-P4 | `p4_bt_classic` | LMP (pairing, authentication, encryption setup, AFH), L2CAP, SDP, AVDTP source, AVRCP, SBC encoder, bitpool that follows the link load |
+| Classic link layer | ESP32-C6 | `br_ll` engine + `c6_firmware` adapter ("Soft-BR") | inquiry, page, connection, ARQ, E0, AFH and 1- and 3-slot basic-rate packets, sent and received with the BLE radio as raw items in the stock controller's scheduler |
 
 ## Stream timing
 - CIG: ISO interval 10 ms, 2 CIS (left, right), NSE 2 (a second transmission chance inside each event), BN 1, FT 4.
@@ -25,3 +27,21 @@
 - In crowded places, earbud advertisements replace the weakest non-audio entries in a full scan table.
 - When the second earbud is missing, joining is retried 4 times quickly, then every 3 minutes for as long as
   the first one stays connected.
+
+## Bluetooth Classic (Soft-BR)
+- The ESP32-C6 has no BR/EDR controller. The `br_ll` engine builds every basic-rate packet itself (access code,
+  header with HEC, payload with CRC, whitening, E0) and hands it to the BLE radio at 1 Msym/s GFSK as a raw schedule
+  item of the stock controller, so BLE and Wi-Fi keep their turns in the same scheduler. Design and every hardware
+  trial: [bt-classic-soft-br.md](bt-classic-soft-br.md) (in Polish).
+- The engine is the master of one link. It does not page-scan or inquiry-scan: the device is never discoverable
+  or connectable, it only calls devices itself.
+- The P4 host speaks HCI to the engine for inquiry and connection. LMP runs on the P4 and travels in vendor
+  commands and events (0xFC31), L2CAP and everything above it as ACL data; the same vendor command returns the
+  engine's counters once a second (`bt_classic_get_diag`).
+- Packet size: the engine sends 3-slot packets and falls back to 1-slot ones only after a confirming round shows
+  the peer does not take them; a lowered size is tried again after 2 s (doubling to 32 s).
+- One audio device at a time: the C6 refuses LE scans and LE connection attempts while the engine works, and the
+  application must not start the engine while an LE connection exists (see [integration.md](integration.md),
+  section 6).
+- A crash of the C6 leaves a record that the next start keeps in flash and reports in the trace
+  (`tools/br_selftest.py --box`).

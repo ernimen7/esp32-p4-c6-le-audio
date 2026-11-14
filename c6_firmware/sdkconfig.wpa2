@@ -1,0 +1,4 @@
+# Cyberdeck: addition to sdkconfig.guardtest for the bench image without WPA3 (sh build.sh --guard-test-wpa2).
+# The station then joins a WPA2/WPA3 access point with WPA2: a login that fails under WPA3 with reason 2 either
+# works (the access point's WPA3 is the problem) or fails in the WPA2 handshake (the password is wrong).
+CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n

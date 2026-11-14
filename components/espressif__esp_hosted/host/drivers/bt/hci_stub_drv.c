@@ -15,11 +15,54 @@ static const char TAG[] = "hci_stub_drv";
  * All H4 types in both directions without filtering: CMD 0x01, ACL 0x02, EVT 0x04 and ISO 0x05 (LE Audio CIS) - the
  * SDIO transport carries the first byte in hci_pkt_type, and receive hands the packet over with the type byte. The
  * counterpart in vhci_drv.c (NimBLE/Bluedroid stack) drops ISO, but that file is not compiled in this configuration. */
+#define HCI_EXTRA_RX_CBS 4
 static esp_hosted_cyberdeck_hci_rx_cb_t s_hci_rx_cb = NULL;
+static esp_hosted_cyberdeck_hci_rx_cb_t s_extra_rx_cbs[HCI_EXTRA_RX_CBS];
+static SemaphoreHandle_t s_hci_tx_mtx = NULL;
+static portMUX_TYPE s_hci_cb_mux = portMUX_INITIALIZER_UNLOCKED;
 
 void esp_hosted_cyberdeck_set_hci_rx_cb(esp_hosted_cyberdeck_hci_rx_cb_t cb)
 {
+	portENTER_CRITICAL(&s_hci_cb_mux);
 	s_hci_rx_cb = cb;
+	portEXIT_CRITICAL(&s_hci_cb_mux);
+}
+
+esp_err_t esp_hosted_cyberdeck_add_hci_rx_cb(esp_hosted_cyberdeck_hci_rx_cb_t cb)
+{
+	if (!cb) {
+		return ESP_ERR_INVALID_ARG;
+	}
+	esp_err_t ret = ESP_ERR_NO_MEM;
+	portENTER_CRITICAL(&s_hci_cb_mux);
+	for (int i = 0; i < HCI_EXTRA_RX_CBS; i++) {
+		if (s_extra_rx_cbs[i] == cb) {
+			ret = ESP_OK;
+			break;
+		}
+	}
+	if (ret != ESP_OK) {
+		for (int i = 0; i < HCI_EXTRA_RX_CBS; i++) {
+			if (s_extra_rx_cbs[i] == NULL) {
+				s_extra_rx_cbs[i] = cb;
+				ret = ESP_OK;
+				break;
+			}
+		}
+	}
+	portEXIT_CRITICAL(&s_hci_cb_mux);
+	return ret;
+}
+
+void esp_hosted_cyberdeck_remove_hci_rx_cb(esp_hosted_cyberdeck_hci_rx_cb_t cb)
+{
+	portENTER_CRITICAL(&s_hci_cb_mux);
+	for (int i = 0; i < HCI_EXTRA_RX_CBS; i++) {
+		if (s_extra_rx_cbs[i] == cb) {
+			s_extra_rx_cbs[i] = NULL;
+		}
+	}
+	portEXIT_CRITICAL(&s_hci_cb_mux);
 }
 
 int esp_hosted_cyberdeck_hci_tx(const uint8_t *data, uint16_t len)
@@ -27,15 +70,36 @@ int esp_hosted_cyberdeck_hci_tx(const uint8_t *data, uint16_t len)
 	if (!data || !len) {
 		return ESP_FAIL;
 	}
+	if (s_hci_tx_mtx == NULL) {
+		SemaphoreHandle_t m = xSemaphoreCreateMutex();
+		if (m != NULL) {
+			portENTER_CRITICAL(&s_hci_cb_mux);
+			if (s_hci_tx_mtx == NULL) {
+				s_hci_tx_mtx = m;
+				m = NULL;
+			}
+			portEXIT_CRITICAL(&s_hci_cb_mux);
+			if (m != NULL) {
+				vSemaphoreDelete(m);
+			}
+		}
+	}
 	/* Cyberdeck: the copy that lives while queued goes to PSRAM - the SDIO write task copies it into the transport
-	 * buffer anyway (H_BUFF_NO_ZEROCOPY), and an LE Audio stream is ~100-200 packets/s that should not churn
-	 * internal DMA memory. */
+	 * buffer anyway (H_BUFF_NO_ZEROCOPY), and an LE Audio / Classic A2DP stream is ~100-200 packets/s that should
+	 * not churn internal DMA memory. */
 	uint8_t *ptr = MEM_ALLOC_PREFER_PSRAM(len);
 	if (!ptr) {
 		return ESP_FAIL;
 	}
 	memcpy(ptr, data, len);
-	return esp_hosted_tx(ESP_HCI_IF, 0, ptr, len, H_BUFF_NO_ZEROCOPY, H_DEFLT_FREE_FUNC);
+	if (s_hci_tx_mtx != NULL) {
+		xSemaphoreTake(s_hci_tx_mtx, portMAX_DELAY);
+	}
+	int rc = esp_hosted_tx(ESP_HCI_IF, 0, ptr, len, H_BUFF_NO_ZEROCOPY, H_DEFLT_FREE_FUNC);
+	if (s_hci_tx_mtx != NULL) {
+		xSemaphoreGive(s_hci_tx_mtx);
+	}
+	return rc;
 }
 
 #if H_BT_HOST_ESP_NIMBLE
@@ -53,9 +117,25 @@ int esp_hosted_cyberdeck_hci_tx(const uint8_t *data, uint16_t len)
    in the SDIO receive thread. */
 int hci_rx_handler(interface_buffer_handle_t *buf_handle)
 {
-	esp_hosted_cyberdeck_hci_rx_cb_t cb = s_hci_rx_cb;
-	if (cb && buf_handle && buf_handle->payload && buf_handle->payload_len) {
-		cb(buf_handle->payload, buf_handle->payload_len);
+	if (!buf_handle || !buf_handle->payload || !buf_handle->payload_len) {
+		return ESP_OK;
+	}
+	esp_hosted_cyberdeck_hci_rx_cb_t primary;
+	esp_hosted_cyberdeck_hci_rx_cb_t extras[HCI_EXTRA_RX_CBS];
+	portENTER_CRITICAL(&s_hci_cb_mux);
+	primary = s_hci_rx_cb;
+	for (int i = 0; i < HCI_EXTRA_RX_CBS; i++) {
+		extras[i] = s_extra_rx_cbs[i];
+	}
+	portEXIT_CRITICAL(&s_hci_cb_mux);
+
+	if (primary) {
+		primary(buf_handle->payload, buf_handle->payload_len);
+	}
+	for (int i = 0; i < HCI_EXTRA_RX_CBS; i++) {
+		if (extras[i]) {
+			extras[i](buf_handle->payload, buf_handle->payload_len);
+		}
 	}
 	return ESP_OK;
 }

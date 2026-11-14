@@ -42,6 +42,9 @@
 #include "coprocessor_fw_version.h"
 #include "fw_guard.h"
 #include "cis_c6_hang.h"
+#if CONFIG_CYBERDECK_WIFI_TAP
+#include "wifi_tap.h"
+#endif
 
 static const char *TAG = "fg_mcu_slave";
 
@@ -943,6 +946,9 @@ void app_main()
 	create_debugging_tasks();
 
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
+#if CONFIG_CYBERDECK_WIFI_TAP
+	wifi_tap_init();
+#endif
 
 	while(!datapath) {
 		vTaskDelay(10);

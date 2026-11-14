@@ -41,4 +41,4 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 #   and ESP_LOG from op_log add up to about 2.5 kB over stock (-fstack-usage: hci_set_cig 352, diag 336 + 288,
 #   update_buffer_hdr 304, drain_rx 304). The LL task's stack headroom is read by diagnostic 0xFC30 (subcommand 3).
 CONFIG_BT_LE_MAX_CONNECTIONS=6
-CONFIG_BT_LE_CONTROLLER_TASK_STACK_SIZE=6144
+CONFIG_BT_LE_CONTROLLER_TASK_STACK_SIZE=8192

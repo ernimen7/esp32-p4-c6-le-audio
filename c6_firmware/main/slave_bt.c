@@ -38,6 +38,7 @@ static const char *TAG = "h_bt";
 
 #if BLUETOOTH_HCI
 #include "cis_c6.h"
+#include "br_c6.h"
 /* ***** HCI specific part ***** */
 
 #define VHCI_MAX_TIMEOUT_MS 	2000
@@ -86,7 +87,7 @@ int slave_bt_send_to_host(const uint8_t *data, uint16_t len)
 static int host_rcv_pkt(uint8_t *data, uint16_t len)
 {
 	/* The CIS engine inspects controller events; it consumes only what it replaces itself (README v5). */
-	if (cis_c6_c2h(data, len)) {
+	if (cis_c6_c2h(data, len) || br_c6_c2h(data, len)) {
 		return 0;
 	}
 	return slave_bt_send_to_host(data, len);
@@ -106,7 +107,10 @@ void process_hci_rx_pkt(uint8_t *payload, uint16_t payload_len)
 	payload--;
 	payload_len++;
 
-	/* Cyberdeck v5: LE ISO commands and HCI ISO packets (type 0x05) go to the CIS engine in the LL task. */
+	/* Cyberdeck v5 + v6: Soft-BR Classic commands/ACL (handle 0x0B00 / 0xFC31) and LE ISO go to the LL task. */
+	if (br_c6_h2c(payload, payload_len)) {
+		return;
+	}
 	if (cis_c6_h2c(payload, payload_len)) {
 		return;
 	}
@@ -258,9 +262,12 @@ esp_err_t initialise_bluetooth(void)
 
 	xSemaphoreGive(vhci_send_sem);
 
-	/* A CIS adapter error does not stop BLE: everything then works as in v4. */
+	/* A CIS or Soft-BR adapter error does not stop BLE: everything else continues normally. */
 	if (cis_c6_init() != 0) {
 		ESP_LOGE(TAG, "LE Audio (CIS) disabled, BLE unchanged");
+	}
+	if (br_c6_init() != 0) {
+		ESP_LOGE(TAG, "BT Classic (Soft-BR) disabled, BLE/LE Audio unchanged");
 	}
 #endif
 #endif
@@ -279,6 +286,7 @@ void deinitialize_bluetooth(void)
 		vSemaphoreDelete(vhci_send_sem);
 		vhci_send_sem = NULL;
 	}
+	br_c6_deinit();
 	cis_c6_deinit();
 	esp_bt_controller_disable();
 	esp_bt_controller_deinit();

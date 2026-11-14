@@ -9,8 +9,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Total trial time (summed across restarts) after which an unconfirmed image is rolled back. */
+/* Total trial time (summed across restarts) after which an unconfirmed image is rolled back. The bench self-test
+ * image, which never confirms itself, sets a shorter one for the whole component (main/CMakeLists.txt). */
+#ifndef FW_GUARD_TRIAL_SECS
 #define FW_GUARD_TRIAL_SECS          600u
+#endif
 /* Crashes (panic, interrupt/task watchdog, brownout) during the trial that trigger an immediate rollback. */
 #define FW_GUARD_MAX_CRASHES         3u
 /* Boots during the trial (e.g. the P4 restarts the C6 on each of its own starts). */

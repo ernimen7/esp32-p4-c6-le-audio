@@ -1,7 +1,6 @@
 // MP3 player for the example: every *.mp3 under the music directory (recursive, sorted), in a loop forever.
-// dr_mp3 decodes, the Resampler (from the original firmware, polyphase windowed sinc) converts to 48 kHz stereo, and
-// le_audio_write_pcm() blocks until the LE Audio encoder queue has room - the CIS stream is the clock.
-// Earbud gestures (GMCS Media Control Point) control it: Play / Pause / Stop / Next / Previous.
+// The sound follows the connection: to the Bluetooth Classic stream (A2DP, SBC) when a Classic device is connected,
+// to the LE Audio stream (CIS, LC3) when earbuds are. devices.cpp sees to it that only one of them is.
 #include "player.h"
 
 #include "resample.h"
@@ -20,8 +19,10 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+#include "bt_classic.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "le_audio.h"
@@ -31,6 +32,9 @@ namespace {
 constexpr const char* kTag = "player";
 constexpr size_t kReadBuf  = 16 * 1024;  // stdio buffer: one 16 kB SD transaction instead of many small reads
 constexpr size_t kChunk    = 1152;       // one MPEG-1 Layer III frame
+// A paused player keeps a Classic stream open this long, then suspends it (AVDTP SUSPEND): a speaker with an open
+// stream and no sound keeps its amplifier on, and the stream fills the radio time Wi-Fi could use.
+constexpr int64_t kSuspendAfterUs = 5 * 1000 * 1000;
 
 std::atomic<bool> g_paused{false};
 std::atomic<int> g_skip{0};  // +1 next, -1 previous (consumed by the decode loop)
@@ -105,7 +109,29 @@ void pollMediaCommands()
             case LE_AUDIO_MEDIA_NEXT: g_skip = 1; break;
             case LE_AUDIO_MEDIA_PREVIOUS: g_skip = -1; break;
         }
-        ESP_LOGI(kTag, "earbud gesture: %d", (int)c);
+        ESP_LOGI(kTag, "LE Audio gesture: %d", (int)c);
+    }
+
+    for (;;) {
+        const bt_classic_media_cmd_t bc = bt_classic_take_media_command();
+        if (bc == BTC_MEDIA_CMD_NONE) {
+            break;
+        }
+        switch (bc) {
+            case BTC_MEDIA_CMD_PLAY: g_paused = false; break;
+            case BTC_MEDIA_CMD_PAUSE:
+            case BTC_MEDIA_CMD_STOP: g_paused = true; break;
+            case BTC_MEDIA_CMD_NEXT: g_skip = 1; break;
+            case BTC_MEDIA_CMD_PREV: g_skip = -1; break;
+            case BTC_MEDIA_CMD_VOL_UP:
+                bt_classic_set_volume((uint8_t)std::clamp((int)bt_classic_get_volume() + 20, 0, 255));
+                break;
+            case BTC_MEDIA_CMD_VOL_DOWN:
+                bt_classic_set_volume((uint8_t)std::clamp((int)bt_classic_get_volume() - 20, 0, 255));
+                break;
+            default: break;
+        }
+        ESP_LOGI(kTag, "AVRCP button: %d", (int)bc);
     }
 }
 
@@ -142,8 +168,9 @@ int playFile(const std::string& path, drmp3* mp3, char* fileBuf, int16_t* pcm, s
     g_rate      = mp3->sampleRate;
     ESP_LOGI(kTag, "playing %s (%u Hz, %u ch)", title.c_str(), (unsigned)mp3->sampleRate, (unsigned)mp3->channels);
     le_audio_set_media_state(true, !g_paused.load(), title.c_str(), 0);
-    bool wasPaused = g_paused.load();
-    int skip       = 0;
+    bool wasPaused        = g_paused.load();
+    int64_t pausedSinceUs = 0;
+    int skip              = 0;
     for (;;) {
         pollMediaCommands();
         if ((skip = g_skip.exchange(0)) != 0) {
@@ -154,26 +181,62 @@ int playFile(const std::string& path, drmp3* mp3, char* fileBuf, int16_t* pcm, s
             wasPaused = paused;
             le_audio_set_media_state(true, !paused, title.c_str(), 0);
         }
-        if (paused || !le_audio_ready()) {
-            vTaskDelay(pdMS_TO_TICKS(50));  // keep the position until the stream is up / playback resumes
+        if (paused) {
+            if (pausedSinceUs == 0) {
+                pausedSinceUs = esp_timer_get_time();
+            } else if (esp_timer_get_time() - pausedSinceUs >= kSuspendAfterUs) {
+                bt_classic_status_t idle;
+                bt_classic_get_status(&idle);
+                if (idle.state == BT_CLASSIC_STREAMING) {
+                    bt_classic_stop();
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-        const drmp3_uint64 got = drmp3_read_pcm_frames_s16(mp3, kChunk, pcm);
-        if (got == 0) {
-            break;  // end of file (or a decode error)
-        }
-        g_posFrames += got;
-        out48.clear();
-        rs.process(pcm, (size_t)got, out48);
-        const size_t frames = out48.size() / 2;
-        s16.resize(out48.size());
-        for (size_t i = 0; i < out48.size(); i++) {
-            const float v = std::clamp(out48[i] * 32768.0f, -32768.0f, 32767.0f);
-            s16[i]        = (int16_t)std::lrintf(v);
-        }
-        size_t done = 0;
-        while (done < frames && le_audio_ready()) {
-            done += le_audio_write_pcm(s16.data() + done * 2, frames - done, 200);
+        pausedSinceUs = 0;
+
+        if (bt_classic_ready()) {
+            bt_classic_status_t bst;
+            bt_classic_get_status(&bst);
+            if (bst.state != BT_CLASSIC_STREAMING) {
+                if (bt_classic_start() != ESP_OK) {
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    continue;
+                }
+            }
+            const drmp3_uint64 got = drmp3_read_pcm_frames_s16(mp3, kChunk, pcm);
+            if (got == 0) {
+                break;
+            }
+            g_posFrames += got;
+            // The stream task is the clock: the write waits until it has read the buffer down, which paces the
+            // decoder. A link that went down ends the loop; the frames it did not take are not played.
+            size_t done = 0;
+            for (int tries = 0; done < (size_t)got && bt_classic_ready() && tries < 20; tries++) {
+                done += bt_classic_write_pcm(pcm + done * mp3->channels, (size_t)got - done, mp3->sampleRate,
+                                             (int)mp3->channels, 100);
+            }
+        } else if (!le_audio_ready()) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        } else {
+            const drmp3_uint64 got = drmp3_read_pcm_frames_s16(mp3, kChunk, pcm);
+            if (got == 0) {
+                break;
+            }
+            g_posFrames += got;
+            out48.clear();
+            rs.process(pcm, (size_t)got, out48);
+            const size_t frames = out48.size() / 2;
+            s16.resize(out48.size());
+            for (size_t i = 0; i < out48.size(); i++) {
+                const float v = std::clamp(out48[i] * 32768.0f, -32768.0f, 32767.0f);
+                s16[i]        = (int16_t)std::lrintf(v);
+            }
+            size_t done = 0;
+            while (done < frames && le_audio_ready()) {
+                done += le_audio_write_pcm(s16.data() + done * 2, frames - done, 200);
+            }
         }
     }
     drmp3_uninit(mp3);

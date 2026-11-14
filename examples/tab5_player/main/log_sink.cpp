@@ -3,7 +3,9 @@
 //    without blocking, so a missing / late host does not stall the tasks that log.
 // 2. Optional copy of every log line to the SD card (/sd/tab5_player.log, previous run in tab5_player.old):
 //    the log hook only appends to a RAM ring (never blocks, drops when busy or full), a low-priority task writes it
-//    out every 2 s and fsyncs, so the log survives the reset that ends a test.
+//    out every 2 s and fsyncs, so the log survives the reset that ends a test. A restart by software (esp_restart,
+//    which is how the esp_hosted driver gives up on a silent co-processor) first has that task write what is
+//    pending: the lines right before such a restart are the ones that say why.
 #include "log_sink.h"
 
 #include <cstdarg>
@@ -14,6 +16,7 @@
 #include "driver/usb_serial_jtag_vfs.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -32,13 +35,15 @@ char* s_ring                = nullptr;  // PSRAM; s_fill bytes pending
 size_t s_fill               = 0;
 uint32_t s_dropped          = 0;
 char s_path[64]             = {};
+TaskHandle_t s_writer       = nullptr;
+SemaphoreHandle_t s_written = nullptr;  // given after every pass of the writer task
 
 int hook(const char* fmt, va_list ap)
 {
     va_list copy;
     va_copy(copy, ap);
     const int n = s_prev != nullptr ? s_prev(fmt, ap) : vprintf(fmt, ap);
-    char line[256];
+    char line[384];  // a line cut at 256 also lost its line end: the next entry ran into it (sound trial 8)
     const int len = vsnprintf(line, sizeof(line), fmt, copy);
     va_end(copy);
     if (len > 0 && xSemaphoreTake(s_lock, 0) == pdTRUE) {
@@ -60,11 +65,13 @@ void writerTask(void*)
     FILE* f   = std::fopen(s_path, "w");
     if (out == nullptr || f == nullptr) {
         ESP_LOGE(kTag, "SD log not started (%s)", out == nullptr ? "no memory" : "cannot create file");
+        s_writer = nullptr;
         vTaskDelete(nullptr);
         return;
     }
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        xSemaphoreGive(s_written);
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));  // a notification asks for the pending lines now
         size_t n         = 0;
         uint32_t dropped = 0;
         xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -87,10 +94,22 @@ void writerTask(void*)
             std::fclose(f);
             f = std::fopen(s_path, "w");
             if (f == nullptr) {
+                s_writer = nullptr;
                 vTaskDelete(nullptr);
                 return;
             }
         }
+    }
+}
+
+// Runs in the task that called esp_restart, whose stack may be small: the writer task does the file work.
+void flushBeforeRestart()
+{
+    // Two passes: the first may be one that was already under way and so misses the newest lines.
+    for (int pass = 0; pass < 2 && s_writer != nullptr; pass++) {
+        xSemaphoreTake(s_written, 0);
+        xTaskNotifyGive(s_writer);
+        xSemaphoreTake(s_written, pdMS_TO_TICKS(1000));
     }
 }
 
@@ -120,11 +139,16 @@ void log_sink_sd_start(const char* dir)
     std::snprintf(old, sizeof(old), "%s/tab5_player.old", dir);
     std::remove(old);
     std::rename(s_path, old);  // previous run kept once
-    s_prev = esp_log_set_vprintf(hook);
-    if (xTaskCreate(writerTask, "log-sd", 6144, nullptr, 2, nullptr) != pdPASS) {
+    s_written = xSemaphoreCreateBinary();
+    s_prev    = esp_log_set_vprintf(hook);
+    if (s_written == nullptr || xTaskCreate(writerTask, "log-sd", 6144, nullptr, 2, &s_writer) != pdPASS) {
+        s_writer = nullptr;
         esp_log_set_vprintf(s_prev);
         ESP_LOGE(kTag, "SD log: task not started");
         return;
+    }
+    if (esp_register_shutdown_handler(flushBeforeRestart) != ESP_OK) {
+        ESP_LOGW(kTag, "SD log: the lines right before a restart may be missing (handler not registered)");
     }
     ESP_LOGI(kTag, "log copied to %s every 2 s (previous run: %s)", s_path, old);
 #else

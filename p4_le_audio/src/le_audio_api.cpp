@@ -416,6 +416,14 @@ void le_audio_disconnect(void)
     }
 }
 
+esp_err_t le_audio_forget(const char *addr)
+{
+    if (!g_init || addr == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return lehost::btForget(addr) > 0 ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
 bool le_audio_ready(void)
 {
     return halLeAudioSinkReady();
