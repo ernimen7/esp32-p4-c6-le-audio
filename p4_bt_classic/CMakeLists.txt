@@ -1,0 +1,31 @@
+set(BR_LL_DIR "${CMAKE_CURRENT_LIST_DIR}/../br_ll")
+
+idf_component_register(
+    SRCS
+        "src/sbc_enc.c"
+        "src/btc_lmp.cpp"
+        "src/btc_l2cap_avdtp.cpp"
+        "src/btc_host.cpp"
+        "${BR_LL_DIR}/br_crypto.c"
+        "${BR_LL_DIR}/br_proto.c"
+        "${BR_LL_DIR}/br_hop.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "src"
+        "${BR_LL_DIR}"
+    REQUIRES
+        esp_common
+    PRIV_REQUIRES
+        espressif__esp_hosted
+        esp_wifi
+        esp_driver_sdmmc
+        esp_timer
+        esp_pm
+        mbedtls
+        pthread
+        freertos
+        log
+        heap
+        esp_hw_support
+)

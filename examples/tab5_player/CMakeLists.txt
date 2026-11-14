@@ -1,8 +1,9 @@
 # tab5_player - LE Audio MP3 player example for the M5Stack Tab5 (ESP32-P4 + ESP32-C6 running c6_firmware).
 cmake_minimum_required(VERSION 3.16)
 
-# The LE Audio host component and the patched esp_hosted host (raw HCI channel incl. ISO) from this repository.
+# The BT Classic (Soft-BR A2DP/AVRCP) host, LE Audio host, and patched esp_hosted host from this repository.
 set(EXTRA_COMPONENT_DIRS
+    "${CMAKE_CURRENT_LIST_DIR}/../../p4_bt_classic"
     "${CMAKE_CURRENT_LIST_DIR}/../../p4_le_audio"
     "${CMAKE_CURRENT_LIST_DIR}/../../components/espressif__esp_hosted"
     # Patched fatfs: exFAT and SD transfers of at most 16 kB (components/fatfs/PATCHES.md)

@@ -7,7 +7,9 @@
 extern "C" {
 #endif
 
-/* Starts the player task: every *.mp3 under music_dir (recursive), forever. music_dir must stay valid. */
+/* Starts the player task: every *.mp3 under music_dir (recursive), forever. music_dir must stay valid. The sound
+ * goes to the Bluetooth Classic stream when a Classic device is connected and to the LE Audio stream when earbuds
+ * are; with neither, the player waits. */
 void player_start(const char *music_dir);
 void player_title(char *out, size_t cap);
 bool player_paused(void);

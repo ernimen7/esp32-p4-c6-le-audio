@@ -11,10 +11,10 @@ if(NOT EXISTS "${C6_IMAGE}")
 endif()
 
 idf_component_register(
-    SRCS "main.cpp" "ui.cpp" "log_sink.cpp" "player.cpp" "resample.cpp" "bond_store.cpp" "c6_update.cpp" "board_tab5.c"
-         "dr_impl.c"
+    SRCS "main.cpp" "ui.cpp" "devices.cpp" "bt_list_model.cpp" "log_sink.cpp" "player.cpp" "resample.cpp"
+         "bond_store.cpp" "c6_update.cpp" "board_tab5.c" "dr_impl.c"
     INCLUDE_DIRS "." "${DR_LIBS_DIR}"
-    PRIV_REQUIRES p4_le_audio espressif__esp_hosted m5stack_tab5 lvgl__lvgl espressif__esp_lvgl_port esp_driver_i2c esp_driver_sdmmc sdmmc fatfs vfs nvs_flash
+    PRIV_REQUIRES p4_bt_classic p4_le_audio espressif__esp_hosted m5stack_tab5 lvgl__lvgl espressif__esp_lvgl_port esp_driver_i2c esp_driver_sdmmc sdmmc fatfs vfs nvs_flash
                   esp_driver_usb_serial_jtag app_update esp_partition esp_timer esp_mm esp_hw_support
 )
 target_add_binary_data(${COMPONENT_TARGET} "${C6_IMAGE}" BINARY)

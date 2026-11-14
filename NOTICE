@@ -1,8 +1,9 @@
 esp32-p4-c6-le-audio
 Copyright (c) 2026 Ernest Domaradzki (visual_form) - MIT License (see LICENSE)
 
-The MIT license covers this project's own code: cis_ll/, the CIS adapter and fw_guard files in c6_firmware/main
-(cis_c6_*, fw_guard*), c6_firmware/cmake, p4_le_audio/, examples/tab5_player/ (except board_tab5.c), tools/ and docs/.
+The MIT license covers this project's own code: cis_ll/, br_ll/, the CIS adapter, the Classic adapter and the
+fw_guard files in c6_firmware/main (cis_c6_*, br_c6_*, fw_guard*), c6_firmware/cmake, p4_le_audio/, p4_bt_classic/,
+examples/tab5_player/ (except board_tab5.c), tools/ and docs/.
 
 Third-party code INCLUDED in this repository (each keeps its own license and copyright headers):
 

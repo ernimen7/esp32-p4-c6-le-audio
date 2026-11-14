@@ -1,6 +1,7 @@
-# Using LE Audio in your own ESP32-P4 firmware
+# Using LE Audio and Bluetooth Classic in your own ESP32-P4 firmware
 
-This guide adds LE Audio to an existing ESP-IDF project on an ESP32-P4 + ESP32-C6 board.
+This guide adds LE Audio to an existing ESP-IDF project on an ESP32-P4 + ESP32-C6 board; section 6 adds Bluetooth
+Classic (A2DP source, experimental) next to it.
 [`p4_le_audio/test/compile_check`](../p4_le_audio/test/compile_check) is the smallest firmware that follows it, and
 the Tab5 demo [`examples/tab5_player`](../examples/tab5_player) a complete one (UI, bonds in NVS, device list, C6
 installer). Both are built in CI, so they always match the API.
@@ -12,7 +13,8 @@ installer). Both are built in CI, so they always match the API.
 | `p4_le_audio/` | The LE Audio host: BAP unicast client, CSIP, LC3, ISO over HCI, C6 firmware update. C API in `include/le_audio.h`. |
 | `components/espressif__esp_hosted/` | esp_hosted 1.4.0 host with the patches the host needs: a raw HCI channel that carries ISO packets, transport bring-up without Wi-Fi, a longer OTA end timeout ([PATCHES.md](../components/espressif__esp_hosted/PATCHES.md)). The stock component does not work. |
 | `third_party/liblc3` | Fetched by `sh tools/fetch_deps.sh` (liblc3 v1.1.3). Elsewhere: set `LIBLC3_DIR`. |
-| `c6_firmware/` or `esp32c6-firmware-*.zip` from Releases | The ESP32-C6 firmware with the CIS link layer. Without it `le_audio_init()` returns `ESP_ERR_NOT_SUPPORTED`. |
+| `c6_firmware/` or `esp32c6-firmware-*.zip` from Releases | The ESP32-C6 firmware with the CIS link layer (and, from 1.5.0, the Classic one). Without it `le_audio_init()` returns `ESP_ERR_NOT_SUPPORTED`. |
+| `p4_bt_classic/` (optional) | The Bluetooth Classic host: LMP, L2CAP, SDP, AVDTP source, AVRCP, SBC encoder. C API in `include/bt_classic.h`. See section 6. |
 
 Add the two components to your project (`EXTRA_COMPONENT_DIRS` or copy them into `components/`), list
 `p4_le_audio` in the `REQUIRES` / `PRIV_REQUIRES` of the component that uses it, and add `espressif/esp_wifi_remote`
@@ -110,3 +112,62 @@ an image is on trial the C6 refuses another OTA (`ESP_ERR_INVALID_STATE`).
   fails (0x3E); see the known limitations in the [README](../README.md#known-limitations).
 - **Legacy I2C driver:** components that pull in the legacy I2C driver next to `i2c_master` abort at start; on the
   Tab5 this was `esp_codec_dev` (`CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE` off).
+
+## 6. Bluetooth Classic next to LE Audio (experimental)
+
+`p4_bt_classic` plays to a Bluetooth Classic speaker or headphones (A2DP source, SBC) through the same C6 and the
+same transport. It needs C6 firmware 1.5.4 or newer (earlier 1.5.x images could restart the C6 at a Classic
+command after LE connection activity); the Tab5 demo uses both hosts and is the reference
+([`examples/tab5_player/main/devices.cpp`](../examples/tab5_player/main/devices.cpp)).
+
+```c
+// After the transport is up (and after le_audio_init, if you use both hosts: they share the HCI channel, each
+// takes its own packets).
+bt_classic_config_t cfg = BT_CLASSIC_CONFIG_DEFAULT();
+cfg.device_name = "My device";
+cfg.kv = my_classic_store;       // one key, "bt.classic_bond": up to four remembered devices with their link keys
+                                 // (a secret). Same rule as the LE store: serve it from RAM, write NVS elsewhere.
+bt_classic_init(&cfg);
+if (!bt_classic_c6_supported()) { /* C6 firmware without Classic, or its crash fuse is open (see below) */ }
+
+bt_classic_device_t found[16];
+int n = bt_classic_scan(found, 16, 6500, true);    // 6.5 s inquiry, then the names of the audio devices
+bt_classic_connect_device(&found[user_choice]);    // pairs a new device; a remembered one uses its key
+// later: bt_classic_connect_bonded() connects the remembered device that was used last
+bt_classic_start();                                // AVDTP START
+
+// From your audio task. timeout_ms > 0 waits for room, so a file decoder is paced by the stream;
+// timeout_ms <= 0 never waits, for a producer with its own clock. Any sample rate, mono or stereo.
+bt_classic_write_pcm(pcm, frames, 44100, 2, 100);
+```
+
+Rules that are yours to keep:
+
+- **One Bluetooth device at a time.** Before any Classic call that uses the radio (`bt_classic_scan`,
+  `bt_classic_connect_*`) disconnect the LE device (`le_audio_disconnect`) and wait for it; do not start an LE
+  scan or connection while a Classic one runs. The C6 answers an LE scan or connection attempt with Command
+  Disallowed while its Classic engine works, but it does not refuse a Classic command while an LE connection
+  exists, and that combination has not been tried on 1.5.4. Run both hosts' radio calls from one worker, as the
+  demo does.
+- `bt_classic_scan`, `bt_classic_connect_*`, `bt_classic_start` and `bt_classic_disconnect` block for seconds
+  (a page that nobody answers takes about 17 s): call them from a task.
+- The speaker's buttons arrive through `bt_classic_take_media_command`; the volume is `bt_classic_set_volume`
+  (0..255, the scale of `le_audio_set_volume`).
+
+When the sound stutters, read `bt_classic_get_diag`: `tx_size_level` (0 = 3-slot packets; a link that stays at 1
+is too slow for the stream), `size_strikes`, `tx_flushes`, `bitpool`, `link_busy_pct`, `media_lost`. The bitpool
+follows the link load by itself (`bt_classic_set_link_limits`).
+
+**Crash fuse and black box of the C6.** Two crashes of the C6 while its Classic layer works switch that layer off
+until the next start (LE Audio and Wi-Fi go on; `bt_classic_c6_supported()` then returns false), and the record is
+forgotten after three minutes without a crash. After any crash the C6 keeps what its panic left - reason, task,
+code addresses from the stack and the last characters its ROM printed, where the closed Bluetooth controller names
+a failed assertion of its own - in flash, and writes it at every start into the trace that vendor command
+0xFC30 sub-command 0x0A returns (records 0xBB, 0xBC to 0xBE, 0xC9 to 0xCB; formats in
+`c6_firmware/main/br_c6_core.c`). A firmware that serves that trace as JSON (`GET /api/c6/cis/trace?from=N`, the
+way the firmware this project was extracted from does) can be read with
+`python tools/br_selftest.py HOST --box`. If your device restarts when a Classic call starts, that record is the
+first thing to read and to attach to a bug report.
+
+What it is not: basic rate only (no EDR), SBC only, source only, one device, and tested with one speaker - see the
+known limitations in the [README](../README.md#known-limitations).

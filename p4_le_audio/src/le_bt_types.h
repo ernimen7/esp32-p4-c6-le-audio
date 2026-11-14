@@ -124,6 +124,9 @@ BtLink_t btLink();
 std::vector<BtDevice_t> btScan(int durationS);
 bool btConnect(const std::string& addr, uint8_t addrType, const std::string& knownName);
 void btDisconnect();
+// Erases the saved key of this device (also when it shows up under a private address its key resolves). For a
+// connected set: the keys of both earbuds, and the set is disconnected. Returns the number of keys erased.
+int btForget(const std::string& addr);
 bool btTakeMediaCommand(BtMediaCmd& out);
 void btSetMediaState(bool active, bool playing, const std::string& title, uint32_t durationMs);
 BtReconnect btReconnect(const std::string& addr, uint8_t addrType, const std::string& name);

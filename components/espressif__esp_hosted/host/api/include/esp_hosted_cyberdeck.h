@@ -43,6 +43,8 @@ void esp_hosted_cyberdeck_sdmmc_unlock(void);
  * (hci_stub_drv.c): the first byte is the H4 packet type (0x01 CMD, 0x02 ACL, 0x04 EVT, 0x05 ISO). */
 typedef void (*esp_hosted_cyberdeck_hci_rx_cb_t)(const uint8_t *data, uint32_t len);
 void esp_hosted_cyberdeck_set_hci_rx_cb(esp_hosted_cyberdeck_hci_rx_cb_t cb);
+esp_err_t esp_hosted_cyberdeck_add_hci_rx_cb(esp_hosted_cyberdeck_hci_rx_cb_t cb);
+void esp_hosted_cyberdeck_remove_hci_rx_cb(esp_hosted_cyberdeck_hci_rx_cb_t cb);
 int esp_hosted_cyberdeck_hci_tx(const uint8_t *data, uint16_t len);
 
 /* le-audio patch 8: bring the SDIO transport to the C6 up without Wi-Fi - reset the slave (EN) and wait up to

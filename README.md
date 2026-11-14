@@ -1,16 +1,18 @@
-# Bluetooth LE Audio on ESP32-P4 + ESP32-C6
+# Bluetooth LE Audio and Bluetooth Classic audio on ESP32-P4 + ESP32-C6
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-%E2%98%95-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/visual_form)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![ESP-IDF v5.5.5](https://img.shields.io/badge/ESP--IDF-v5.5.5-red)
 
-Stereo Bluetooth LE Audio from an ESP32-P4 + ESP32-C6 board (tested: M5Stack Tab5) to off-the-shelf LE Audio
-earbuds.
+Stereo audio from an ESP32-P4 + ESP32-C6 board (tested: M5Stack Tab5) to off-the-shelf Bluetooth devices: LE Audio
+earbuds, and - new in 0.2.0, experimental - Bluetooth Classic speakers and headphones (A2DP).
 
-Neither chip can do this out of the box: they have no Classic Bluetooth (so no A2DP), and the stock ESP32-C6
-Bluetooth controller has no LE Isochronous Channels (so no LE Audio). This project adds a Connected Isochronous
-Stream (CIS) link layer on top of Espressif's stock ESP32-C6 controller and an LE Audio host component for the
-ESP32-P4 that drives it over HCI. This repository contains everything needed to build it into your own device.
+Neither chip can do this out of the box: they have no Classic Bluetooth radio (so no A2DP), and the stock ESP32-C6
+Bluetooth controller has no LE Isochronous Channels (so no LE Audio). This project adds two things to the ESP32-C6
+firmware, next to each other in one image: a Connected Isochronous Stream (CIS) link layer on top of Espressif's
+stock controller, and a Bluetooth Classic basic-rate link layer that sends and receives Classic packets with the
+BLE radio ("Soft-BR"). On the ESP32-P4, two host components drive them over HCI. This repository contains
+everything needed to build it into your own device.
 
 ![M5Stack Tab5 with Samsung Galaxy Buds3 Pro connected over LE Audio](docs/img/tab5-le-audio.jpg)
 
@@ -27,13 +29,20 @@ ESP32-P4 that drives it over HCI. This repository contains everything needed to 
 - Earbud gestures: play / pause, next and previous track (Media Control).
 - Pairing driven by your UI: scan, list the devices nearby, connect or pair the one the user picks.
 - C6 firmware update from your P4 firmware over SDIO: no USB-UART adapter needed on boards like the Tab5.
-- A ready-to-flash demo for the M5Stack Tab5: MP3 from the SD card, touch screen, device list, C6 installer.
+- **Bluetooth Classic A2DP (experimental).** Inquiry, pairing (Secure Simple Pairing, or a PIN for old devices),
+  encryption, SDP, AVDTP and an SBC stream at 44.1 kHz, through the same C6 firmware and with Wi-Fi left on. The
+  bitpool follows the link: 20 to 25 with the tested speaker (about 146 to 174 kbit/s). Up to four devices are
+  remembered and reconnect with their saved key. Measured at home: 6 minutes of music, 0 of 21 554 media packets
+  lost.
+- A ready-to-flash demo for the M5Stack Tab5: MP3 from the SD card, touch screen, one device list for LE Audio and
+  Classic with the remembered devices on top, C6 installer.
 
 ## Quick test on an M5Stack Tab5
 
-The demo player ([`examples/tab5_player`](examples/tab5_player)) plays MP3 files from the SD card to your earbuds.
-You need LE Audio earbuds (tested: Samsung Galaxy Buds3 Pro; [reports for other models](#tested-earbuds) are
-welcome), a microSD card (FAT32 or exFAT), a USB-C cable and Python with `esptool` (`pip install esptool`).
+The demo player ([`examples/tab5_player`](examples/tab5_player)) plays MP3 files from the SD card to your earbuds
+or your speaker. You need LE Audio earbuds or a Bluetooth Classic speaker (tested: Samsung Galaxy Buds3 Pro and one
+portable speaker; [reports for other devices](#tested-devices) are welcome), a microSD card (FAT32 or exFAT), a
+USB-C cable and Python with `esptool` (`pip install esptool`).
 
 1. Copy your music into a folder named `music` at the root of the card and insert the card into the Tab5. Only
    MP3 files are played (any bitrate and sample rate, mono or stereo); other files are skipped. Subfolders are
@@ -43,10 +52,13 @@ welcome), a microSD card (FAT32 or exFAT), a USB-C cable and Python with `esptoo
    ```
    python -m esptool --chip esp32p4 -p <PORT> -b 460800 --before default_reset --after hard_reset write_flash "@flash_args"
    ```
-3. On first start the player reports that the C6 has no LE Audio firmware. Tap **C6 firmware → Install**. It takes
-   about 30 seconds, then the Tab5 restarts.
+3. On first start the player reports that the C6 firmware has neither LE Audio nor Classic. Tap
+   **C6 firmware → Install**. It takes about 30 seconds, then the Tab5 restarts.
 4. Put the earbuds into pairing mode (Galaxy Buds: both in the case, lid open, hold the touch pads until the LED
-   pulses) and tap them in the list. Both earbuds play; next time they connect by themselves.
+   pulses), or the speaker into its pairing mode, tap **Scan** and tap the device in the list. It moves to the
+   remembered part on top; next time the player connects it at start if it answers.
+5. One audio device plays at a time. Tap another device in the list to switch to it, tap the connected one to
+   disconnect, hold a remembered one to forget it.
 
 If something goes wrong, see [Flashing and recovery](docs/flashing-and-recovery.md). A C6 firmware that does not
 work goes back to the previous one by itself.
@@ -61,7 +73,9 @@ P4, and Docker for the builds in this repository (ESP-IDF v5.5.5).
 2. **P4 side.** Add the [`p4_le_audio`](p4_le_audio) component and the patched esp_hosted host from
    [`components/`](components) to your project. [docs/integration.md](docs/integration.md) walks through the
    configuration and the bring-up order; [`p4_le_audio/test/compile_check`](p4_le_audio/test/compile_check) is the
-   smallest firmware that uses the API, and the [Tab5 demo](examples/tab5_player) a complete one.
+   smallest firmware that uses the API, and the [Tab5 demo](examples/tab5_player) a complete one. For Bluetooth
+   Classic add [`p4_bt_classic`](p4_bt_classic) as well (it needs [`br_ll`](br_ll) next to it); its API is in
+   `include/bt_classic.h`, and the demo's `main/devices.cpp` shows how the two hosts share the radio.
 3. **Install the C6 firmware from your P4 firmware.** Link the image into your app and call
    `le_audio_c6_install()` after the user agrees: it is sent over SDIO with esp_hosted's OTA. Without such a
    firmware, the C6 can be flashed over its UART pads
@@ -80,7 +94,20 @@ against your project and adapt it, and what not to do with the C6.
   the earbud and restarts in stereo.
 - The microphone direction (earbud → P4) is not verified with NSE 2. No Broadcast (Auracast).
 - Tested only on the M5Stack Tab5 (ESP32-C6 on SDIO).
-- No Classic Bluetooth (A2DP) speakers: neither chip has a BR/EDR radio.
+
+Bluetooth Classic (experimental):
+
+- It is basic rate only, in software, on a radio built for BLE; it is not a qualified BR/EDR implementation, and it
+  has been used with one speaker for a few days. Expect devices that do not work.
+- One audio device at a time. The two host components do not guard each other: your application must disconnect
+  the LE device before it scans for or connects a Classic one, as the demo's connection manager does. Up to C6
+  firmware 1.5.2 a Classic command after LE connection activity restarted the C6 (and the P4's SDIO driver then
+  the board); 1.5.4 removes the cause that was found, but a Classic page while an LE connection is up has not
+  been tried on it.
+- No EDR, so SBC stays at a modest bitpool (25 at most with the tested speaker, which also stops answering for
+  about 50 ms several times a second). A2DP source and AVRCP only: no microphone, no hands-free profile, no AAC or
+  aptX.
+- A remembered Classic device is connected on request, not in the background.
 
 ## How it works
 
@@ -96,6 +123,11 @@ isochronous traffic; what its controller lacks is the link-layer scheduling for 
   application.
 - **HCI over SDIO** (esp_hosted) with credit-based ISO flow control, a deadline queue that rides out SDIO stalls, and
   recovery of lost Number-Of-Completed-Packets events.
+- **Bluetooth Classic through the BLE radio.** The same C6 firmware builds Classic basic-rate packets (access
+  code, header, whitening, CRC, E0 encryption, frequency hopping with AFH) and hands them to the stock
+  controller's scheduler as raw radio items, so BLE and Wi-Fi keep their turns. On the P4, `p4_bt_classic` runs
+  LMP, L2CAP, SDP, AVDTP, AVRCP and the SBC encoder. Trial notes, in Polish:
+  [docs/bt-classic-soft-br.md](docs/bt-classic-soft-br.md).
 
 ```mermaid
 graph LR
@@ -144,6 +176,12 @@ A broken ESP32-C6 image is hard to fix without a cable, so the C6 firmware guard
   reset.
 - Two C6 crashes while a CIS is active disable the CIS layer until the next update; the C6 then runs as a plain BLE
   controller.
+- Two C6 crashes in a row while the Classic layer works switch that layer off for that start; three minutes without
+  a crash clear the record, so it is back after the next restart.
+- A crash leaves a record: the panic reason, the task, code addresses from the stack and the last characters the
+  ROM printed (the closed Bluetooth controller names a failed assertion of its own only there). The next start
+  keeps it in flash and every start writes it to the trace the P4 reads
+  ([docs/integration.md](docs/integration.md), section 6).
 - The P4 can always reset the C6 (EN line) and power-cycle it.
 - Last resort, only if an image breaks SDIO before the guard can act: the C6 UART pads (J1 "C6_ISP" on the Tab5)
   and a 3.3 V USB-UART adapter.
@@ -157,6 +195,7 @@ use Git Bash. None of these commands flash anything.
 sh tools/fetch_deps.sh                       # liblc3 v1.1.3 and dr_libs at pinned commits -> third_party/
 sh c6_firmware/build.sh                      # C6 firmware: host tests, build, hook check -> RESULT: PASS
 sh p4_le_audio/test/compile_check/build.sh   # p4_le_audio built for the ESP32-P4 with the patched esp_hosted
+sh p4_bt_classic/test/compile_check/build.sh # p4_bt_classic built for the ESP32-P4
 sh examples/tab5_player/build.sh             # Tab5 demo with the C6 image embedded -> build/tab5_player.bin
 ```
 
@@ -167,16 +206,22 @@ Tests without hardware, in the same image
 sh cis_ll/test/run.sh             # CIS engine unit tests (ASan, UBSan)
 sh cis_ll/sim/run.sh              # discrete-event simulator: reference peripheral, drift, host jitter, NSE 2
 sh p4_le_audio/test/host/run.sh   # P4 models: HCI ISO, credits, PACS/ASCS, LC3, P4 <-> C6 HCI contract, CSIP, C6 image, SD split
+sh br_ll/test/run.sh              # Classic engine unit tests (Core sample data for hopping, access code, E0)
+sh br_ll/sim/run.sh               # Classic simulator: inquiry to stream against a scripted speaker, eight link conditions
+sh p4_bt_classic/test/host/run.sh # Classic host: LMP, pairing, L2CAP, AVDTP, SBC, remembered devices
+sh examples/tab5_player/test/host/run.sh   # the demo's device list
 python tools/privacy_scan.py      # no private data in the tree
 ```
 
 | Path | Contents |
 |---|---|
 | [`cis_ll/`](cis_ll) | Portable CIS link-layer engine (C11), unit tests and simulator |
-| [`c6_firmware/`](c6_firmware) | ESP32-C6 firmware: esp_hosted slave, CIS adapter on the stock controller, `fw_guard` |
+| [`c6_firmware/`](c6_firmware) | ESP32-C6 firmware: esp_hosted slave, CIS adapter and Classic adapter (`br_c6_*`) on the stock controller, `fw_guard` |
 | [`p4_le_audio/`](p4_le_audio) | ESP-IDF component: LE Audio host for the ESP32-P4, C API in `include/le_audio.h`, host tests, compile check |
+| [`br_ll/`](br_ll) | Portable Bluetooth Classic basic-rate link-layer engine (C11), unit tests and simulator |
+| [`p4_bt_classic/`](p4_bt_classic) | ESP-IDF component: Bluetooth Classic A2DP source host for the ESP32-P4, C API in `include/bt_classic.h`, host tests, compile check |
 | [`components/`](components) | esp_hosted 1.4.0 host with the patches the LE Audio host needs ([PATCHES.md](components/espressif__esp_hosted/PATCHES.md)); for the demo: fatfs with exFAT, Tab5 display stack |
-| [`examples/tab5_player/`](examples/tab5_player) | Tab5 demo: MP3 from SD card, touch UI, device list, C6 installer |
+| [`examples/tab5_player/`](examples/tab5_player) | Tab5 demo: MP3 from SD card, touch UI, one device list for LE Audio and Classic, C6 installer |
 | [`tools/`](tools) | C6 OTA client for a network endpoint, privacy scan, dependency fetch |
 | [`docs/`](docs) | Integration guide, architecture, C6 link layer, flashing and recovery, measurements |
 
@@ -192,6 +237,19 @@ le_audio_get_status(&st);                             // link, members, SDU / cr
 le_audio_c6_install(image, size, progress, NULL);     // C6 firmware over SDIO (after the user agrees)
 ```
 
+And the Classic one (after `le_audio_init`, with no LE device connected):
+
+```c
+bt_classic_config_t cfg = BT_CLASSIC_CONFIG_DEFAULT();
+cfg.kv = my_classic_store;                            // remembered devices (address, link key, name)
+bt_classic_init(&cfg);                                // asks the C6 whether its firmware has Soft-BR
+int n = bt_classic_scan(found, 16, 6500, true);       // inquiry; names of the audio devices
+bt_classic_connect_device(&found[0]);                 // pairs a new device, uses the saved key for a known one
+bt_classic_start();                                   // AVDTP START
+bt_classic_write_pcm(pcm, frames, 44100, 2, 100);     // waits for room: the stream task is the clock
+bt_classic_get_diag(&diag);                           // bitpool, link load, packets sent and lost
+```
+
 ## Status
 
 - Builds and host tests pass; the component and the Tab5 demo build for the ESP32-P4.
@@ -202,13 +260,25 @@ le_audio_c6_install(image, size, progress, NULL);     // C6 firmware over SDIO (
   BLE-only demo: 13 minutes of stereo past the 600 s trial limit, without a rollback.
 - Not tested yet: installing over the M5Stack factory C6 firmware (our Tab5 already ran an earlier version of this
   firmware).
+- Bluetooth Classic, C6 firmware 1.5.4, in the firmware this project was extracted from: pairing, reconnecting with
+  the saved key, music with Wi-Fi on (bitpool 20 to 25; 0 of 16 174 media packets lost in 4 minutes, and 0 of
+  21 554 in 6 minutes with 1.5.1), pause and resume, volume. The LE Audio earbuds and the Classic speaker are
+  both in use with that one C6 image. Not verified yet: the speaker's own buttons (AVRCP), any second Classic
+  device.
+- The Tab5 demo of this release, tried on the Tab5: start, scanning (LE and Classic), the speaker over Classic
+  (connect, encrypted stream, disconnect) and the earbuds over LE Audio (stereo on both). Not verified in the
+  demo: switching from one device to the other while one is connected, forgetting a device, saving a new pairing
+  (the trial build kept the bond store read-only), and more than a few seconds of music on the speaker.
+  Forgetting a device works in the firmware this project was extracted from, with the same host components
+  (`le_audio_forget`, `bt_classic_forget`); what has not been tried is the demo's own use of them.
 
-## Tested earbuds
+## Tested devices
 
 | Device | Mode | Status | Notes |
 |---|---|---|---|
-| Samsung Galaxy Buds3 Pro | 2 × CIS, stereo | Working | L/R in sync, reconnect from saved keys, gestures |
-| Your earbuds | unicast CIS | ? | [Open a test report](.github/ISSUE_TEMPLATE/earbud-report.md) |
+| Samsung Galaxy Buds3 Pro | LE Audio, 2 × CIS, stereo | Working | L/R in sync, reconnect from saved keys, gestures |
+| X8 Pro (portable speaker) | Classic, A2DP SBC 44.1 kHz | Working | bitpool 20 to 25, reconnect from the saved key, pause and resume |
+| Your earbuds or speaker | | ? | [Open a test report](.github/ISSUE_TEMPLATE/earbud-report.md) |
 
 ## Background
 
@@ -221,6 +291,20 @@ by step they came together into what you see here.
 
 All I needed was a cyberdeck that does what I want. I hope this project helps other hobbyists use their own
 earbuds with their own devices.
+
+## Acknowledgements
+
+Thanks to [ProgrammingAce](https://github.com/ProgrammingAce) for
+[tab5-a2dp](https://github.com/ProgrammingAce/tab5-a2dp), a Bluetooth Classic (A2DP) experiment built on this
+project's C6 firmware. It showed on hardware that the C6's BLE modem receives Classic packets and that a speaker
+can be reached this way. The measurement notes in its source also answered two questions the Classic work here
+was stuck on: how the modem hands over a received Classic packet, and that it silently drops a transmission set
+up too soon after a receive window, which is why our first 190 pages got no answer.
+
+No code from that repository is used here. The two projects take different routes: tab5-a2dp runs Classic in a
+test-mode session of the controller, this one schedules Classic packets through the stock controller next to
+Wi-Fi and LE Audio (`br_ll/`, `c6_firmware/main/br_c6_*`, `p4_bt_classic/`). What was learned from it is recorded
+in [docs/bt-classic-soft-br.md](docs/bt-classic-soft-br.md) (in Polish, section of 2026-11-10).
 
 ## Contributing
 

@@ -164,6 +164,10 @@ esp_err_t le_audio_restart(void);
 /* Manual stop / disconnect: the background manager does not start / reconnect again until the next connection. */
 void le_audio_stop(void);
 void le_audio_disconnect(void);
+/* Forgets a device: erases its saved key (addr as in le_audio_device_t / le_audio_status_t; a private address
+ * its key resolves counts too). For a connected set the keys of both earbuds go and the set is disconnected. With
+ * a read-only store (kv.set == NULL) the key is gone until reset only. ESP_ERR_NOT_FOUND: no key for it. */
+esp_err_t le_audio_forget(const char *addr);
 
 /* true = the stream accepts PCM. */
 bool le_audio_ready(void);

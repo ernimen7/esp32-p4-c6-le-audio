@@ -27,6 +27,12 @@ jobs:
         run: docker run --rm -v "$PWD:/src" -w /src --entrypoint bash "$IDF_IMAGE" -c "SIM_OUT=/tmp/sim sh cis_ll/sim/run.sh"
       - name: P4 LE Audio model tests (with sanitizers)
         run: docker run --rm -v "$PWD:/src" -w /src --entrypoint bash "$IDF_IMAGE" -c "SANITIZE=1 sh p4_le_audio/test/host/run.sh"
+      - name: Classic engine unit tests and simulator (ASan + UBSan)
+        run: docker run --rm -v "$PWD:/src" -w /src --entrypoint bash "$IDF_IMAGE" -c "sh br_ll/test/run.sh && sh br_ll/sim/run.sh"
+      - name: P4 Bluetooth Classic host tests (ASan + UBSan)
+        run: docker run --rm -v "$PWD:/src" -w /src --entrypoint bash "$IDF_IMAGE" -c "sh p4_bt_classic/test/host/run.sh"
+      - name: Tab5 demo device list test (ASan + UBSan)
+        run: docker run --rm -v "$PWD:/src" -w /src --entrypoint bash "$IDF_IMAGE" -c "sh examples/tab5_player/test/host/run.sh"
       - name: Tool tests and privacy scan
         run: |
           python3 -I -m unittest discover -s tools/tests
@@ -53,6 +59,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build p4_le_audio for the ESP32-P4 (compile check firmware)
         run: sh p4_le_audio/test/compile_check/build.sh
+      - name: Build p4_bt_classic for the ESP32-P4 (compile check firmware)
+        run: sh p4_bt_classic/test/compile_check/build.sh
 
   tab5-player:
     runs-on: ubuntu-24.04

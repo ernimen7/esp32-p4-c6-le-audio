@@ -1360,6 +1360,9 @@ void onHciRx(const uint8_t* data, uint32_t len)
         if (data[0] == 0x02 && len >= 5) {
             const uint16_t hdr    = (uint16_t)data[1] | ((uint16_t)data[2] << 8);
             const uint16_t handle = hdr & 0x0FFF;
+            if (handle == 0x0B00) {
+                return;  // Soft-BR Bluetooth Classic ACL handle belongs to p4_bt_classic
+            }
             const uint8_t pb      = (hdr >> 12) & 0x03;
             const uint16_t aclLen = (uint16_t)data[3] | ((uint16_t)data[4] << 8);
             const uint32_t avail  = std::min<uint32_t>(len - 5, aclLen);
@@ -1455,6 +1458,9 @@ void onHciRx(const uint8_t* data, uint32_t len)
             } else if (evtCode == 0x05 && avail >= 4) {
                 // HCI_Disconnection_Complete
                 const uint16_t h = ((uint16_t)params[1] | ((uint16_t)params[2] << 8)) & 0x0FFF;
+                if (h == 0x0B00) {
+                    return;  // Soft-BR Bluetooth Classic handle
+                }
                 ESP_LOGW(kTag, "HCI Disconnection_Complete handle=0x%04X status=0x%02X reason=0x%02X", h, params[0],
                          avail >= 4 ? params[3] : 0xFF);
                 forwardLeEventLocked(ev, 2 + avail);  // CIS or earbud ACL - LE Audio ends the stream
@@ -1473,6 +1479,9 @@ void onHciRx(const uint8_t* data, uint32_t len)
                 }
             } else if (evtCode == 0x13 && avail >= 1) {
                 // Number_Of_Completed_Packets: ISO buffer credits (ACL is sent without flow control)
+                if (avail >= 3 && (((uint16_t)params[1] | ((uint16_t)params[2] << 8)) & 0x0FFF) == 0x0B00) {
+                    return;  // Soft-BR Bluetooth Classic ACL credit return
+                }
                 forwardLeEventLocked(ev, 2 + avail);
             } else if (evtCode == 0x3E && avail >= 2) {
                 const uint8_t sub = params[0];
@@ -3887,6 +3896,59 @@ bool lehost::btJoinSet()
     joinSetMember();
     std::lock_guard<std::mutex> l(g_bt.stateLock);
     return aclUpLocked(g_bt.secondHandle);
+}
+
+int lehost::btForget(const std::string& addr)
+{
+    uint8_t target[6] = {};
+    if (!parseMac(addr, target)) {
+        return 0;
+    }
+    bool inSet    = false;
+    size_t erased = 0;
+    {
+        std::lock_guard<std::recursive_mutex> op(g_bt.opLock);
+        uint8_t peers[2][6] = {};
+        int n               = 0;
+        app::btbond::BondList all;
+        {
+            std::lock_guard<std::mutex> l(g_bt.stateLock);
+            std::memcpy(peers[n++], target, 6);
+            // A set: the main or the second earbud is forgotten - the keys of both (to the earbuds it is one pairing)
+            uint8_t mainAddr[6] = {};
+            const bool mainUp   = aclUpLocked(g_bt.status.connHandle) && parseMac(g_bt.status.addr, mainAddr);
+            const bool secondUp = aclUpLocked(g_bt.secondHandle);
+            const bool isMain   = mainUp && std::memcmp(mainAddr, target, 6) == 0;
+            const bool isSecond = secondUp && std::memcmp(g_bt.secondPeer, target, 6) == 0;
+            if (isMain && secondUp) {
+                std::memcpy(peers[n++], g_bt.secondPeer, 6);
+            } else if (isSecond) {
+                std::memcpy(peers[n++], mainAddr, 6);
+            }
+            inSet = (isMain && secondUp) || isSecond;
+            for (int i = 0; i < n; i++) {
+                // Type 1: the same address, or a private address the bond's IRK resolves (bondMatches)
+                for (int idx; (idx = app::btbond::findBond(g_bt.bonds, 1, peers[i], aes128Be)) >= 0;) {
+                    app::btbond::eraseBond(g_bt.bonds, idx);
+                    erased++;
+                }
+            }
+            if (isMain || isSecond) {
+                g_bt.set = BtEngine::SetInfo{};
+            }
+            all = g_bt.bonds;
+        }
+        if (erased > 0) {
+            saveBondNvs(all);
+        }
+        wipeBonds(all);
+        ESP_LOGI(kTag, "Bond: forgotten %u (set: %s), devices left %u", (unsigned)erased, inSet ? "both" : "no",
+                 (unsigned)app::btbond::bondCount(all));
+    }
+    if (inSet) {
+        btDisconnect();  // both earbuds - without keys they pair anew anyway
+    }
+    return (int)erased;
 }
 
 void lehost::btDisconnect()

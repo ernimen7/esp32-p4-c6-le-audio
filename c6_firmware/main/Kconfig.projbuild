@@ -7,6 +7,28 @@ menu "Cyberdeck"
 			so after the 10-minute trial the guard must roll back to the previous image. It reports the
 			coprocessor version with the FW_GUARD_TEST_PATCH patch number (fw_guard.h), so the P4 sees the rollback.
 			Build: sh build.sh --guard-test (separate build_guardtest directory). Never in a regular build.
+
+	config CYBERDECK_BR_SELFTEST
+		bool "Soft-BR self-test: periodic GIAC inquiry + counters in the CIS trace (debug only)"
+		depends on CYBERDECK_FW_GUARD_TEST
+		default n
+		help
+			Debug image for bench tests under any host: the C6 starts a 10.24 s inquiry every 16 s by itself and
+			keeps the events of those inquiries to itself. A host that speaks Soft-BR takes over with its first
+			Soft-BR command or ACL packet: the self-test inquiries stop and events go to the host as in a regular
+			image. In both cases engine/radio counters, inquiry results, raw RX captures and slots the adapter did
+			not take back are written to the CIS trace (0xFC30 subcommand 10, kinds 0xB0..0xB7). Its trial time
+			is 7 minutes instead of 10.
+
+	config CYBERDECK_WIFI_TAP
+		bool "Wi-Fi tap: the access point's answers to this station in the CIS trace (debug only)"
+		depends on CYBERDECK_BR_SELFTEST
+		default n
+		help
+			The station listens in promiscuous mode and writes the authentication, association response,
+			deauthentication and disassociation frames addressed to it to the CIS trace (kinds 0xC0, 0xC1) from the
+			self-test tick. The Soft-BR self-test then stays silent for the first 2 minutes after Bluetooth starts,
+			so the records of a Wi-Fi login test are not pushed out of the trace.
 endmenu
 
 menu "Example Configuration"

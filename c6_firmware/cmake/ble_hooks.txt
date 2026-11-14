@@ -10,3 +10,4 @@ ble_ll_ctrl.c.o  r_ble_ll_ctrl_enc_req_make
 ble_lll_conn.c.o r_ble_lll_conn_coex_dpc_process
 ble_lll_conn.c.o r_ble_lll_conn_recycle_buffer
 ble_lll_conn.c.o r_ble_lll_conn_end
+ble_lll_sched.c.o r_ble_lll_sched_pop_executed_sch
