@@ -333,6 +333,48 @@ void doScan()
               leLinked(st) ? " (no Classic scan while earbuds are connected)" : "");
 }
 
+// What a failed Classic connection says on the screen. ESP_ERR_NOT_ALLOWED: the device answered and then refused
+// the audio channel, as headphones do while a phone or a computer holds them.
+const char* classicFailure(esp_err_t e, bool saved)
+{
+    if (e == ESP_ERR_NOT_ALLOWED) {
+        return "busy - disconnect it from the other device and try again";
+    }
+    return saved ? "no answer - is it switched on?" : "pairing failed";
+}
+
+// The conversation of the link that has just failed goes to the log, in whole items and short lines (the log's
+// copy on the SD card cuts a line at 384 characters, log_sink.cpp): with a device that does not connect it shows
+// where the setup stopped, and it is what a device report needs (bt_classic.h).
+void logTrace(const char* what, size_t (*read)(char*, size_t))
+{
+    std::string text(4400, ' ');
+    text.resize(read(text.data(), text.size()));
+    if (text.empty()) {
+        ESP_LOGW(kTag, "Classic %s trace: empty", what);
+        return;
+    }
+    constexpr size_t kLine = 200;  // an item is 65 characters at most
+    size_t from            = 0;
+    while (from < text.size()) {
+        size_t end = text.size();
+        if (end - from > kLine) {
+            end = text.rfind(' ', from + kLine);
+            if (end == std::string::npos || end <= from) {
+                end = from + kLine;
+            }
+        }
+        ESP_LOGW(kTag, "Classic %s trace: %s", what, text.substr(from, end - from).c_str());
+        from = end + 1;
+    }
+}
+
+void logClassicFailure()
+{
+    logTrace("LMP", bt_classic_lmp_trace_text);
+    logTrace("L2CAP", bt_classic_l2cap_trace_text);
+}
+
 void connectClassic(const btlist::Row& row)
 {
     if (!bt_classic_c6_supported()) {
@@ -364,8 +406,10 @@ void connectClassic(const btlist::Row& row)
     setAction("%s %.63s (up to 30 s)...", row.saved ? "Connecting" : "Pairing", row.name.c_str());
     // A remembered device that was not in the scan is paged with the clock offset kept with its key.
     const esp_err_t e = seen ? bt_classic_connect_device(&dev) : bt_classic_connect_addr(addr, 0, 0);
-    setAction("%.63s: %s", row.name.c_str(),
-              e == ESP_OK ? "connected" : row.saved ? "no answer - is it switched on?" : "pairing failed");
+    if (e != ESP_OK) {
+        logClassicFailure();
+    }
+    setAction("%.63s: %s", row.name.c_str(), e == ESP_OK ? "connected" : classicFailure(e, row.saved));
 }
 
 void connectLe(const btlist::Row& row)
@@ -543,7 +587,13 @@ void doConnectRemembered()
     setAction("Connecting %.63s...", saved[0].name);
     const esp_err_t e = bt_classic_connect_bonded();
     refresh();
-    setAction("%.63s: %s", saved[0].name, e == ESP_OK ? "connected" : "no answer - choose a device or tap Scan");
+    if (e != ESP_OK) {
+        logClassicFailure();
+    }
+    setAction("%.63s: %s", saved[0].name,
+              e == ESP_OK                 ? "connected"
+              : e == ESP_ERR_NOT_ALLOWED ? classicFailure(e, true)
+                                         : "no answer - choose a device or tap Scan");
 }
 
 void worker(void*)

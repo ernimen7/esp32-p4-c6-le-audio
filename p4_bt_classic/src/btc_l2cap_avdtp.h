@@ -63,6 +63,21 @@ typedef struct {
     void (*on_peer_volume)(void *ctx, uint8_t vol_0_255);
 } btc_upper_ops_t;
 
+/* A sink that answers the request for the audio signalling channel with "no resources" is asked again after
+ * BTC_UPPER_AUDIO_RETRY_TICKS calls of btc_upper_on_tick, at most BTC_UPPER_AUDIO_RETRIES times. */
+#define BTC_UPPER_AUDIO_RETRY_TICKS 2u
+#define BTC_UPPER_AUDIO_RETRIES     4u
+
+/* One L2CAP frame of the link, kept for a diagnosis (btc_upper_trace_read). */
+#define BTC_UPPER_TRACE 64u
+typedef struct {
+    uint8_t  dir;   /* 0 sent, 1 received, 2 received but shorter than its header says (dropped) */
+    uint8_t  tick;  /* btc_upper_on_tick calls since btc_upper_trace_clear, about two a second; stops at 255 */
+    uint16_t cid;   /* the channel the frame is addressed to: the peer's for a sent frame, ours for a received one */
+    uint16_t len;   /* payload length from the frame's header */
+    uint8_t  d[24]; /* first payload bytes: enough for an SDP request or a set of AVDTP capabilities */
+} btc_upper_rec_t;
+
 typedef struct btc_upper {
     btc_upper_ops_t  ops;
     uint8_t          preferred_bitpool;
@@ -104,10 +119,36 @@ typedef struct btc_upper {
     uint8_t          vol_notify_label;
     uint8_t          current_vol_7bit; /* 0x00..0x7F */
     bool             peer_abs_volume;  /* the peer accepted SetAbsoluteVolume (btc_upper_peer_sets_volume) */
+
+    /* The peer's refusal of the audio signalling channel: its L2CAP result (btc_upper_audio_refusal), the ticks
+     * until the request goes out again and how many times it has. */
+    uint16_t         audio_refusal;
+    uint8_t          audio_retry_in;
+    uint8_t          audio_retries;
+
+    /* The frames of the current or the last link, media packets left out. Kept last in the struct: btc_upper_reset
+     * clears everything before them. */
+    btc_upper_rec_t  trace[BTC_UPPER_TRACE];
+    uint16_t         trace_n;
+    uint8_t          trace_tick;
 } btc_upper_t;
 
 void btc_upper_init(btc_upper_t *u, const btc_upper_ops_t *ops, uint8_t preferred_bitpool, bool prefer_44k1);
 void btc_upper_reset(btc_upper_t *u);
+
+/* The layer's clock, to be called about twice a second while the link is up: it times the request for the audio
+ * channel that is sent again and the records of the trace. */
+void btc_upper_on_tick(btc_upper_t *u);
+
+/* The L2CAP result with which the peer refused the audio signalling channel (0x0004 "no resources": it is busy,
+ * as headphones that play from another device are), or 0 when it has not refused or the channel is open since. */
+uint16_t btc_upper_audio_refusal(const btc_upper_t *u);
+
+/* The trace of L2CAP frames: emptied where a new link begins and read oldest first (returns the number of records
+ * copied, at most `max_out`). With a device whose setup stops after pairing the counters do not say at which frame
+ * of SDP or AVDTP. */
+void    btc_upper_trace_clear(btc_upper_t *u);
+uint8_t btc_upper_trace_read(const btc_upper_t *u, btc_upper_rec_t *out, uint8_t max_out);
 
 /* Begins outgoing SDP -> AVDTP -> AVRCP connection sequence once LMP + E0 encryption finish. */
 void btc_upper_start_initiator(btc_upper_t *u);

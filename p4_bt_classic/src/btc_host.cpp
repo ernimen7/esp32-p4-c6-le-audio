@@ -97,6 +97,10 @@ struct BtcRuntime {
     bool                 acl_up           = false;
     bool                 setup_ok         = false;
     uint8_t              setup_err        = 0u;
+    /* Where the traces are copied to before they are printed: here, in PSRAM with the rest, and neither on the
+     * caller's stack nor in the internal RAM. */
+    btc_lmp_rec_t        lmp_trace_copy[BTC_LMP_TRACE]     = {};
+    btc_upper_rec_t      l2cap_trace_copy[BTC_UPPER_TRACE] = {};
     bool                 avdtp_ready_flag = false;
 
     /* ACL TX flow-control credits for handle 0x0B00 */
@@ -739,6 +743,7 @@ static void evt_worker_task(void *arg)
         if (rt->acl_up && esp_timer_get_time() - last_lmp_tick_us >= 500000) {
             last_lmp_tick_us = esp_timer_get_time();
             btc_lmp_on_tick(&rt->lmp);
+            btc_upper_on_tick(&rt->upper);
         }
 
         for (;;) {
@@ -1257,6 +1262,7 @@ static esp_err_t connect_internal(BtcRuntime *rt, const uint8_t addr[6], uint16_
         rt->status.phase = BTC_PHASE_LMP_SETUP;
     }
     btc_upper_reset(&rt->upper);
+    btc_upper_trace_clear(&rt->upper);
     btc_lmp_start(&rt->lmp, addr, BTC_LMP_GOAL_CONNECT);
 
     /* Wait up to 12 seconds for LMP + SSP/PIN + E0 + SDP + AVDTP OPEN */
@@ -1296,6 +1302,13 @@ static esp_err_t connect_internal(BtcRuntime *rt, const uint8_t addr[6], uint16_
         xSemaphoreTake(rt->setup_sem, pdMS_TO_TICKS(250));
     }
 
+    /* Read next to the event task that writes it: one 16-bit value, and the link is about to be closed anyway. */
+    const uint16_t refusal = btc_upper_audio_refusal(&rt->upper);
+    if (refusal != 0u) {
+        ESP_LOGW(kTag, "Classic: the device refused the audio channel (L2CAP result 0x%04X)", (unsigned)refusal);
+        abort_and_disconnect_sync(rt);
+        return ESP_ERR_NOT_ALLOWED;
+    }
     ESP_LOGW(kTag, "Classic: the device did not open the audio channel within 12 s");
     abort_and_disconnect_sync(rt);
     return ESP_ERR_TIMEOUT;
@@ -1791,6 +1804,56 @@ extern "C" bt_classic_media_cmd_t bt_classic_take_media_command(void)
         return BTC_MEDIA_CMD_NONE;
     }
     return (bt_classic_media_cmd_t)g_rt->media_cmd.exchange((int)BTC_MEDIA_CMD_NONE, std::memory_order_acq_rel);
+}
+
+extern "C" size_t bt_classic_lmp_trace_text(char *out, size_t size)
+{
+    BtcRuntime *rt = g_rt;
+    if (!out || size == 0u) {
+        return 0u;
+    }
+    out[0] = '\0';
+    if (!rt || !rt->initialized) {
+        return 0u;
+    }
+    /* Read while the event task may be writing: a record can come out half new. Good enough for a diagnosis, and
+     * a lock here would be held across the peer's messages. */
+    btc_lmp_rec_t *rec = rt->lmp_trace_copy;
+    const uint8_t  n   = btc_lmp_trace_read(&rt->lmp, rec, BTC_LMP_TRACE);
+    size_t at = 0u;
+    for (uint8_t i = 0; i < n && at + 20u < size; i++) {
+        at += (size_t)std::snprintf(out + at, size - at, "%c%u:%02x%02x%02x%02x%02x/%u ", rec[i].dir ? 'R' : 'S',
+                                    (unsigned)rec[i].tick, rec[i].d[0], rec[i].d[1], rec[i].d[2], rec[i].d[3],
+                                    rec[i].d[4], (unsigned)rec[i].len);
+    }
+    return at;
+}
+
+extern "C" size_t bt_classic_l2cap_trace_text(char *out, size_t size)
+{
+    BtcRuntime *rt = g_rt;
+    if (!out || size == 0u) {
+        return 0u;
+    }
+    out[0] = '\0';
+    if (!rt || !rt->initialized) {
+        return 0u;
+    }
+    /* Read while the event task may be writing, as in bt_classic_lmp_trace_text. */
+    btc_upper_rec_t *rec = rt->l2cap_trace_copy;
+    const uint8_t    n   = btc_upper_trace_read(&rt->upper, rec, BTC_UPPER_TRACE);
+    size_t at = 0u;
+    for (uint8_t i = 0; i < n && at + 72u < size; i++) { /* an item is 65 characters at most */
+        const btc_upper_rec_t &r = rec[i];
+        at += (size_t)std::snprintf(out + at, size - at, "%c%u:%04x:", r.dir == 0u ? 'S' : (r.dir == 1u ? 'R' : 'X'),
+                                    (unsigned)r.tick, (unsigned)r.cid);
+        const size_t shown = r.len < sizeof(r.d) ? r.len : sizeof(r.d);
+        for (size_t b = 0; b < shown; b++) {
+            at += (size_t)std::snprintf(out + at, size - at, "%02x", r.d[b]);
+        }
+        at += (size_t)std::snprintf(out + at, size - at, "/%u ", (unsigned)r.len);
+    }
+    return at;
 }
 
 extern "C" void bt_classic_get_diag(bt_classic_diag_t *out)

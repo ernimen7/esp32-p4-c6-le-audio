@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.2.1] - 2026-11-16
+
+Bluetooth Classic headphones connect. 0.2.0 played to a Classic speaker, but Sony WH-1000XM3 headphones - the
+second Classic device this project has been used with - never got as far as sound: connecting them ended in an
+error. Two faults of the ESP32-P4 Classic host stopped these headphones every time, the second hidden behind the
+first, and a third made headphones that are busy with another device look like ones that are switched off. The
+speaker had connected in spite of them. This release fixes the three and keeps the tool they were found with: a
+record of what the host and the device said to each other. Only the ESP32-P4 side changed; the ESP32-C6 firmware
+stays 1.5.4 and LE Audio is untouched.
+
+### Fixed
+The three faults of the Classic host, in the order a connection meets them:
+- Pairing stopped at the first "no". This host asks to start pairing (`LMP_io_capability_req`) before the link
+  setup is complete (`LMP_setup_complete`). The headphones refuse that first request with "LMP PDU not allowed"
+  (0x24), and the host gave up. Now the request is sent again a second later, up to three times; the headphones
+  accept the second one.
+- The answer about the host's services was not the one the device had asked for. After pairing, the headphones ask
+  the source for its AudioSource record over SDP, name the one attribute they want and set limits: 32 bytes of
+  attributes per answer, on a channel with an MTU of 48 bytes. The SDP server ignored all of that and sent every
+  attribute in one 68-byte frame, and both of its service records carried a sequence length two bytes short. The
+  headphones dropped that answer and never opened the audio channel, so the connection ended with "the device did
+  not open the audio channel within 12 s". Now a request is answered with the attributes it names, with no more
+  attribute bytes than it allows and within the MTU of its channel; the rest follows on the continuation state,
+  and the records are built from a table that counts their lengths.
+- A refused audio channel was waited out in silence. When a device refuses the AVDTP signalling channel with the
+  L2CAP result "no resources" - headphones do that while another phone or computer holds them - the setup stood
+  still until its 12 s were up, and the failure read like that of a device that is switched off. Now the channel
+  is asked for again every second, up to four times, a channel the device opens itself in that time is used, and
+  a refusal that lasts is reported as one (`ESP_ERR_NOT_ALLOWED`, below).
+
+### Added
+- `bt_classic_connect_*` return `ESP_ERR_NOT_ALLOWED` when the device answered and then refused the audio channel,
+  which is what headphones do while another phone or computer holds them. The Tab5 demo then says "busy -
+  disconnect it from the other device and try again" instead of "no answer - is it switched on?".
+- `bt_classic_lmp_trace_text()` and `bt_classic_l2cap_trace_text()`: a record of what the host and the device said
+  to each other on the current or the last link, as text - the LMP messages (link setup, pairing, encryption) and
+  the L2CAP frames (SDP, AVDTP, AVRCP; no media packets). With a device that does not connect they show where the
+  setup stops - all three fixes above were found that way. The Tab5 demo writes them to its log after a failed
+  Classic connection, and the device report template asks for them.
+- `docs/integration.md`, "When a Classic device does not connect": what each error of `bt_classic_connect_*`
+  means, how to read the two traces, and what to put into a report.
+- Host tests: the SDP server (the headphones' request byte for byte, answers in parts, the MTU limit, 128-bit
+  UUIDs, error codes), the refused audio channel, the pairing request sent again, both traces.
+
+### Changed
+- Tab5 demo: the image carries the version of its release (`0.2.1`, logged at start) instead of a description of
+  the tree it was built from.
+
 ## [0.2.0] - 2026-11-14
 
 Bluetooth Classic next to LE Audio. Classic is experimental: one speaker, a few days.

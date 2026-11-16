@@ -198,6 +198,7 @@ struct LmpTestHarness {
     char                 learned_name[64] = {};
     bool                 master_done = false;
     bool                 master_ok   = false;
+    uint8_t              master_err  = 0;
     uint8_t              master_slots = 1;         /* what the peer allows, as the controller would be told */
     uint8_t              master_slots_why = 0xFF;
     uint8_t              master_slots_at_done = 0; /* the same at the moment the setup was reported done */
@@ -260,10 +261,10 @@ static void harness_on_lk(void *ctx, const uint8_t bd[6], const uint8_t lk[16])
 
 static void harness_on_done(void *ctx, bool ok, uint8_t err)
 {
-    (void)err;
     auto *h = static_cast<LmpTestHarness *>(ctx);
     h->master_done = true;
     h->master_ok   = ok;
+    h->master_err  = err;
     h->master_slots_at_done = h->master_slots;
 }
 
@@ -393,6 +394,139 @@ static int test_lmp_ssp_and_legacy(void)
  * What worked in trial 8 is kept, at a pace that costs nothing: the speaker's request is answered on the next tick
  * with LMP_not_accepted and LMP_max_slot 1, and the answer to our own request is followed by LMP_max_slot 1 at
  * once, so that the last word the speaker has from us on its packets is always one slot. */
+/* The LMP module keeps the last PDUs of the link, both ways: with a device nobody has tried the setup can stop
+ * with silence on both sides (Sony WH-1000XM3, 2026-11-15) and the counters do not say at which PDU. */
+static int test_lmp_keeps_a_trace_of_the_link(void)
+{
+    const uint8_t master_bd[6] = {0x36, 0x10, 0xAA, 0xBB, 0xCC, 0xDD};
+    const uint8_t slave_bd[6]  = {0x99, 0x88, 0x77, 0x66, 0x55, 0x44};
+
+    LmpTestHarness h;
+    btc_lmp_ops_t m_ops = { &h, harness_send_master, harness_start_enc_master, harness_rand,
+                            harness_on_name, harness_on_lk, harness_on_done, harness_on_slots };
+    btc_lmp_ops_t s_ops = { &h, harness_send_slave, nullptr, harness_rand, nullptr, nullptr, nullptr, nullptr };
+    btc_lmp_init(&h.master, &m_ops, master_bd, "Tab5 Classic", "0000");
+    btc_lmp_init(&h.slave, &s_ops, slave_bd, "Speaker", "0000");
+    h.slave.is_slave_sim = true;
+    btc_lmp_start(&h.slave, master_bd, BTC_LMP_GOAL_CONNECT);
+    btc_lmp_start(&h.master, slave_bd, BTC_LMP_GOAL_CONNECT);
+    /* A role switch request of the peer (LMP_switch_req = 19, TID 1): received, then refused with not_accepted. */
+    uint8_t sw_req[5] = { (uint8_t)((19u << 1) | 1u), 0x10, 0x00, 0x00, 0x00 };
+    h.wire.push_back({false, std::vector<uint8_t>(sw_req, sw_req + 5)});
+    pump_lmp_wire(h);
+    CHECK(h.master_done && h.master_ok, "the setup of the traced link completed");
+
+    btc_lmp_rec_t rec[BTC_LMP_TRACE];
+    const uint8_t n = btc_lmp_trace_read(&h.master, rec, BTC_LMP_TRACE);
+    CHECK(n > 10u && n <= BTC_LMP_TRACE, "the trace holds the PDUs of the setup");
+    CHECK(rec[0].dir == 0u && rec[0].len >= 1u, "the first record is the first PDU the master sent");
+    int got_switch = -1, refused_switch = -1;
+    for (int i = 0; i < n; i++) {
+        if (rec[i].dir == 1u && rec[i].d[0] == sw_req[0] && rec[i].len == 5u && rec[i].d[1] == 0x10u) got_switch = i;
+        if (rec[i].dir == 0u && (rec[i].d[0] >> 1) == 4u && rec[i].d[1] == 19u) refused_switch = i;
+    }
+    CHECK(got_switch >= 0, "a received PDU is in the trace with its opcode, TID, length and first parameter");
+    CHECK(refused_switch > got_switch, "the answer sent to it follows it in the trace");
+    CHECK(btc_lmp_trace_read(&h.master, rec, 3u) == 3u && rec[2].dir <= 1u, "a short read gives the oldest records");
+
+    /* The tick counter tells a stall from a quick exchange: two ticks, then one more PDU. */
+    btc_lmp_on_tick(&h.master);
+    btc_lmp_on_tick(&h.master);
+    uint8_t auto_rate[2] = { (uint8_t)(35u << 1), 0xEEu };
+    btc_lmp_on_pdu(&h.master, auto_rate, 2u);
+    const uint8_t n2 = btc_lmp_trace_read(&h.master, rec, BTC_LMP_TRACE);
+    CHECK(n2 == n + 1u && rec[n2 - 1u].tick == rec[n - 1u].tick + 2u && rec[n2 - 1u].d[1] == 0xEEu,
+          "a record carries the tick count of its moment");
+
+    /* More PDUs than the trace holds: the oldest go. */
+    for (unsigned i = 0; i < BTC_LMP_TRACE + 6u; i++) {
+        auto_rate[1] = (uint8_t)i;
+        btc_lmp_on_pdu(&h.master, auto_rate, 2u);
+    }
+    CHECK(btc_lmp_trace_read(&h.master, rec, BTC_LMP_TRACE) == BTC_LMP_TRACE, "the trace is full, not longer");
+    CHECK(rec[0].d[1] == 6u && rec[BTC_LMP_TRACE - 1u].d[1] == BTC_LMP_TRACE + 5u, "the oldest records were dropped");
+
+    /* A new link starts with an empty trace. */
+    h.wire.clear();
+    btc_lmp_start(&h.master, slave_bd, BTC_LMP_GOAL_NAME_ONLY);
+    const uint8_t n3 = btc_lmp_trace_read(&h.master, rec, BTC_LMP_TRACE);
+    CHECK(n3 >= 1u && n3 < 8u && rec[0].dir == 0u && rec[0].tick == 0u, "a new link starts the trace again");
+    return 0;
+}
+
+/* Sony WH-1000XM3, 2026-11-15 (LMP trace of the failed connection): the headphones accept the connection, then
+ * answer the first LMP_io_capability_req with LMP_not_accepted_ext, error 0x24 "LMP PDU not allowed" - it reaches
+ * them before they have asked for our features, which they do right after LMP_setup_complete. The module then
+ * waited for ever and the host gave up after 12 s. */
+static void feed_xm3_until_pairing_starts(LmpTestHarness &h)
+{
+    const uint8_t version_res[]  = { (uint8_t)(38u << 1), 0x07, 0x0A, 0x00, 0x07, 0x00 };
+    const uint8_t features_res[] = { (uint8_t)(40u << 1), 0xFF, 0xFF, 0x8F, 0xFE, 0x9B, 0xFF, 0x59, 0x83 };
+    const uint8_t ext_res[]      = { (uint8_t)(127u << 1), 4, 1, 2, 0x03, 0, 0, 0, 0, 0, 0, 0 };
+    const uint8_t accepted[]     = { (uint8_t)(3u << 1), 51 };
+    const uint8_t setup_done[]   = { (uint8_t)((49u << 1) | 1u) };
+    btc_lmp_on_pdu(&h.master, version_res, sizeof(version_res));
+    btc_lmp_on_pdu(&h.master, features_res, sizeof(features_res));
+    btc_lmp_on_pdu(&h.master, ext_res, sizeof(ext_res));
+    btc_lmp_on_pdu(&h.master, accepted, sizeof(accepted));
+    btc_lmp_on_pdu(&h.master, setup_done, sizeof(setup_done));
+}
+
+static int count_io_capability_reqs(const LmpTestHarness &h)
+{
+    int n = 0;
+    for (const auto &p : h.wire) {
+        if (p.from_master && p.bytes.size() == 5u && (p.bytes[0] >> 1) == 127u && p.bytes[1] == 25u) n++;
+    }
+    return n;
+}
+
+static int test_lmp_pairing_request_refused_at_first_is_sent_again(void)
+{
+    const uint8_t master_bd[6] = {0x36, 0x10, 0xAA, 0xBB, 0xCC, 0xDD};
+    const uint8_t peer_bd[6]   = {0x99, 0x88, 0x77, 0x66, 0x55, 0x44};
+    const uint8_t not_allowed[]     = { (uint8_t)(127u << 1), 2, 127, 25, 0x24 };
+    const uint8_t pairing_refused[] = { (uint8_t)(127u << 1), 2, 127, 25, 0x18 };
+
+    LmpTestHarness h;
+    btc_lmp_ops_t m_ops = { &h, harness_send_master, harness_start_enc_master, harness_rand,
+                            harness_on_name, harness_on_lk, harness_on_done, harness_on_slots };
+    btc_lmp_init(&h.master, &m_ops, master_bd, "Tab5 Classic", "0000");
+    btc_lmp_start(&h.master, peer_bd, BTC_LMP_GOAL_CONNECT);
+    feed_xm3_until_pairing_starts(h);
+    CHECK(count_io_capability_reqs(h) == 1, "pairing starts with LMP_io_capability_req");
+
+    btc_lmp_on_pdu(&h.master, not_allowed, sizeof(not_allowed));
+    CHECK(!h.master_done, "'LMP PDU not allowed' is not the end of the setup");
+    btc_lmp_on_tick(&h.master);
+    CHECK(count_io_capability_reqs(h) == 1, "the request is not repeated at once");
+    btc_lmp_on_tick(&h.master);
+    CHECK(count_io_capability_reqs(h) == 2, "it is sent again about a second later");
+
+    /* A peer that keeps refusing: three more tries, then the setup fails with the peer's reason. */
+    for (int i = 0; i < 3; i++) {
+        btc_lmp_on_pdu(&h.master, not_allowed, sizeof(not_allowed));
+        btc_lmp_on_tick(&h.master);
+        btc_lmp_on_tick(&h.master);
+    }
+    CHECK(count_io_capability_reqs(h) == 4 && h.master_done && !h.master_ok && h.master_err == 0x24u,
+          "after three repeats the setup fails with the peer's reason");
+
+    /* Any other refusal ends the setup at once: 0x18, the peer does not allow pairing (not in pairing mode). */
+    LmpTestHarness h2;
+    btc_lmp_ops_t m2_ops = { &h2, harness_send_master, harness_start_enc_master, harness_rand,
+                             harness_on_name, harness_on_lk, harness_on_done, harness_on_slots };
+    btc_lmp_init(&h2.master, &m2_ops, master_bd, "Tab5 Classic", "0000");
+    btc_lmp_start(&h2.master, peer_bd, BTC_LMP_GOAL_CONNECT);
+    feed_xm3_until_pairing_starts(h2);
+    btc_lmp_on_pdu(&h2.master, pairing_refused, sizeof(pairing_refused));
+    CHECK(h2.master_done && !h2.master_ok && h2.master_err == 0x18u, "'pairing not allowed' fails the setup at once");
+    btc_lmp_on_tick(&h2.master);
+    btc_lmp_on_tick(&h2.master);
+    CHECK(count_io_capability_reqs(h2) == 1, "and nothing is sent again");
+    return 0;
+}
+
 static int test_lmp_peer_stays_on_one_slot_without_a_loop(void)
 {
     const uint8_t master_bd[6] = {0x36, 0x10, 0xAA, 0xBB, 0xCC, 0xDD};
@@ -578,6 +712,9 @@ struct MockSink {
     uint16_t last_media_seq = 0;  /* RTP sequence number and timestamp of the last media packet */
     uint32_t last_media_ts  = 0;
     bool     refuse_sends   = false; /* as a controller with no room: the stack's send hook returns false */
+    int      refuse_audio   = 0;     /* so many requests for the AVDTP signalling channel get refuse_result */
+    uint16_t refuse_result  = 0x0004u; /* Connection refused - no resources available */
+    int      sig_conn_reqs  = 0;     /* requests for the AVDTP signalling channel seen */
     std::vector<uint8_t> last_avctp;  /* the last AVCTP frame the source sent */
     bt_classic_media_cmd_t last_cmd = BTC_MEDIA_CMD_NONE;
 };
@@ -619,6 +756,16 @@ static void mock_sink_handle_pdu(MockSink *m, const uint8_t *sdu, uint16_t len)
             uint16_t dcid = 0x0060u;
             if (psm == 0x0001u)      { dcid = 0x0061u; m->sdp_src_cid = scid; }
             else if (psm == 0x0019u) {
+                if (m->sig_src_cid == 0) {
+                    m->sig_conn_reqs++;
+                    if (m->refuse_audio > 0) {
+                        m->refuse_audio--;
+                        uint8_t no[12] = { 0x03u, id, 8, 0, 0, 0, (uint8_t)scid, (uint8_t)(scid >> 8),
+                                           (uint8_t)m->refuse_result, (uint8_t)(m->refuse_result >> 8), 0, 0 };
+                        mock_send_to_src(m, 0x0001u, no, sizeof(no));
+                        return;
+                    }
+                }
                 if (m->sig_src_cid == 0) { dcid = 0x0062u; m->sig_src_cid = scid; }
                 else                     { dcid = 0x0063u; m->media_src_cid = scid; }
             } else if (psm == 0x0017u) { dcid = 0x0064u; m->avctp_src_cid = scid; }
@@ -821,6 +968,369 @@ static int test_l2cap_avdtp_avrcp(void)
 /* =========================================================================
  * 6. The remembered devices (btc_bonds.h)
  * ========================================================================= */
+/* The L2CAP frames of a link are kept for a diagnosis: with a device whose setup stops after pairing the counters
+ * do not say at which frame of SDP or AVDTP. */
+static int test_upper_keeps_a_trace_of_the_l2cap_frames(void)
+{
+    MockSink m;
+    btc_upper_ops_t ops = {
+        .ctx            = &m,
+        .send_l2cap_pdu = mock_send_from_src,
+        .on_avdtp_ready = [](void *c, const sbc_params_t *, uint16_t) { static_cast<MockSink *>(c)->ready = true; },
+        .on_stream_state = [](void *c, bool s) { static_cast<MockSink *>(c)->streaming = s; },
+        .on_avrcp_state = nullptr,
+        .on_media_cmd   = nullptr,
+        .on_peer_volume = nullptr,
+    };
+    btc_upper_init(&m.src, &ops, 35u, true);
+    btc_upper_rec_t rec[BTC_UPPER_TRACE];
+    CHECK(btc_upper_trace_read(&m.src, rec, BTC_UPPER_TRACE) == 0u, "no frames yet: the trace is empty");
+
+    btc_upper_start_initiator(&m.src);
+    btc_upper_on_tick(&m.src);
+    btc_upper_on_tick(&m.src);
+    pump_upper(m);
+    CHECK(m.ready, "the traced link reached the media channel");
+
+    const uint8_t n = btc_upper_trace_read(&m.src, rec, BTC_UPPER_TRACE);
+    CHECK(n > 12u && n <= BTC_UPPER_TRACE, "the trace holds the frames of the setup");
+    /* L2CAP_ConnectionRequest on the signalling channel: code 0x02, identifier, length 4, PSM 0x0001 (SDP). */
+    CHECK(rec[0].dir == 0u && rec[0].cid == 0x0001u && rec[0].len == 8u && rec[0].tick == 0u &&
+              rec[0].d[0] == 0x02u && rec[0].d[4] == 0x01u && rec[0].d[5] == 0x00u,
+          "the first record is the connection request for SDP, sent before any tick");
+    CHECK(rec[1].dir == 1u && rec[1].cid == 0x0001u && rec[1].d[0] == 0x03u && rec[1].tick == 2u,
+          "the peer's connection response follows, with the tick count of its moment");
+    int sdp_req = -1, sdp_rsp = -1;
+    for (int i = 0; i < n; i++) {
+        if (rec[i].dir == 0u && rec[i].cid == 0x0061u && rec[i].d[0] == 0x06u) sdp_req = i;
+        if (rec[i].dir == 1u && rec[i].cid >= 0x0040u && rec[i].d[0] == 0x07u && rec[i].len == 9u) sdp_rsp = i;
+    }
+    CHECK(sdp_req > 1 && sdp_rsp > sdp_req, "a data frame is there with its channel, length and first bytes");
+    CHECK(btc_upper_trace_read(&m.src, rec, 2u) == 2u && rec[1].d[0] == 0x03u, "a short read gives the oldest records");
+
+    /* A frame shorter than its header says is dropped; the trace shows that it came. */
+    const uint8_t cut[6] = { 0x20, 0x00, 0x40, 0x00, 0x07, 0x00 };
+    btc_upper_on_l2cap_pdu(&m.src, cut, sizeof(cut));
+    const uint8_t n2 = btc_upper_trace_read(&m.src, rec, BTC_UPPER_TRACE);
+    CHECK(n2 == n + 1u && rec[n2 - 1u].dir == 2u && rec[n2 - 1u].len == 0x20u && rec[n2 - 1u].d[0] == 0x07u,
+          "a cut frame is marked as such");
+
+    /* Media packets would push everything else out of the trace within a second. */
+    CHECK(btc_upper_request_start(&m.src), "start requested");
+    pump_upper(m);
+    const uint8_t before_media = btc_upper_trace_read(&m.src, rec, BTC_UPPER_TRACE);
+    uint8_t sbc[83 * 3] = {};
+    CHECK(m.streaming && btc_upper_send_media_packet(&m.src, sbc, sizeof(sbc), 3u, 128u), "a media packet went out");
+    CHECK(btc_upper_trace_read(&m.src, rec, BTC_UPPER_TRACE) == before_media, "media packets are not traced");
+
+    /* The end of the link clears the layer's state, not the trace: it is read after the failure. */
+    btc_upper_reset(&m.src);
+    CHECK(btc_upper_trace_read(&m.src, rec, BTC_UPPER_TRACE) == before_media, "the trace outlives the link");
+    btc_upper_trace_clear(&m.src);
+    CHECK(btc_upper_trace_read(&m.src, rec, BTC_UPPER_TRACE) == 0u, "a new link starts with an empty trace");
+
+    /* More frames than the trace holds: the oldest go. */
+    for (unsigned i = 0; i < BTC_UPPER_TRACE + 5u; i++) {
+        const uint8_t echo[9] = { 0x05, 0x00, 0x01, 0x00, 0x08 /* echo request */, (uint8_t)i, 0x01, 0x00, 0x5A };
+        btc_upper_on_l2cap_pdu(&m.src, echo, sizeof(echo));
+    }
+    const uint8_t n3 = btc_upper_trace_read(&m.src, rec, BTC_UPPER_TRACE);
+    CHECK(n3 == BTC_UPPER_TRACE && rec[n3 - 1u].dir == 0u && rec[n3 - 1u].d[0] == 0x09u &&
+              rec[n3 - 1u].d[1] == (uint8_t)(BTC_UPPER_TRACE + 4u),
+          "a full trace keeps the newest frames, the last one being the answer to the last request");
+    return 0;
+}
+
+static btc_upper_ops_t plain_upper_ops(MockSink *m)
+{
+    btc_upper_ops_t ops = {
+        .ctx            = m,
+        .send_l2cap_pdu = mock_send_from_src,
+        .on_avdtp_ready = [](void *c, const sbc_params_t *, uint16_t) { static_cast<MockSink *>(c)->ready = true; },
+        .on_stream_state = [](void *c, bool s) { static_cast<MockSink *>(c)->streaming = s; },
+        .on_avrcp_state = nullptr,
+        .on_media_cmd   = nullptr,
+        .on_peer_volume = nullptr,
+    };
+    return ops;
+}
+
+static void tick_upper(MockSink &m, int ticks)
+{
+    for (int i = 0; i < ticks; i++) {
+        btc_upper_on_tick(&m.src);
+        pump_upper(m);
+    }
+}
+
+/* One frame from the peer, handled at once. */
+static void feed_src(MockSink &m, uint16_t cid, const uint8_t *pay, uint16_t plen)
+{
+    mock_send_to_src(&m, cid, pay, plen);
+    auto f = std::move(m.to_src.back());
+    m.to_src.pop_back();
+    btc_upper_on_l2cap_pdu(&m.src, f.data(), (uint16_t)f.size());
+}
+
+/* The peer opens an L2CAP channel to the source and both sides configure it. Returns the source's CID for it, or 0
+ * when the source did not answer as it should. What the source sent after its configuration is left in to_sink. */
+static uint16_t peer_opens_channel(MockSink &m, uint16_t psm, uint16_t their_cid, uint16_t their_mtu)
+{
+    m.to_sink.clear();
+    const uint8_t conn_req[8] = { 0x02u, 0x31u, 4, 0, (uint8_t)psm, (uint8_t)(psm >> 8),
+                                  (uint8_t)their_cid, (uint8_t)(their_cid >> 8) };
+    feed_src(m, 0x0001u, conn_req, sizeof(conn_req));
+    if (m.to_sink.size() != 2u) {
+        return 0u;
+    }
+    const std::vector<uint8_t> rsp = m.to_sink[0], creq = m.to_sink[1];
+    if (rsp[4] != 0x03u || rsp[10] != (uint8_t)their_cid || rsp[12] != 0u || rsp[13] != 0u || creq[4] != 0x04u ||
+        creq[8] != (uint8_t)their_cid) {
+        return 0u;
+    }
+    const uint16_t our_cid = (uint16_t)(rsp[8] | (rsp[9] << 8));
+    m.to_sink.clear();
+    const uint8_t their_cfg[12] = { 0x04u, 0x32u, 8, 0, (uint8_t)our_cid, (uint8_t)(our_cid >> 8), 0, 0,
+                                    0x01u, 0x02u, (uint8_t)their_mtu, (uint8_t)(their_mtu >> 8) };
+    const uint8_t our_cfg_ok[10] = { 0x05u, creq[5], 6, 0, (uint8_t)our_cid, (uint8_t)(our_cid >> 8), 0, 0, 0, 0 };
+    feed_src(m, 0x0001u, their_cfg, sizeof(their_cfg));
+    feed_src(m, 0x0001u, our_cfg_ok, sizeof(our_cfg_ok));
+    return our_cid;
+}
+
+/* Sony WH-1000XM3, 2026-11-15: the request for the audio signalling channel came back "pending" and then "refused
+ * - no resources", and the setup stood still until its time was up. The request goes out again a second later, a
+ * few times, and what the peer said is kept for the message to the user. */
+static int test_upper_refused_audio_channel_is_asked_for_again(void)
+{
+    {
+        MockSink m;
+        btc_upper_ops_t ops = plain_upper_ops(&m);
+        m.refuse_audio = 2;
+        btc_upper_init(&m.src, &ops, 35u, true);
+        btc_upper_start_initiator(&m.src);
+        pump_upper(m);
+        CHECK(!m.ready && m.sig_conn_reqs == 1, "refused: nothing more goes out at once");
+        CHECK(btc_upper_audio_refusal(&m.src) == 0x0004u, "the peer's result is kept");
+        tick_upper(m, 1);
+        CHECK(m.sig_conn_reqs == 1, "half a second later: still waiting");
+        tick_upper(m, 1);
+        CHECK(m.sig_conn_reqs == 2 && !m.ready, "a second later the request went out again, and was refused again");
+        tick_upper(m, BTC_UPPER_AUDIO_RETRY_TICKS);
+        CHECK(m.sig_conn_reqs == 3 && m.ready, "the third request is accepted and the setup reaches the media channel");
+        CHECK(btc_upper_audio_refusal(&m.src) == 0u, "a refusal that was overcome is forgotten");
+        tick_upper(m, 8);
+        CHECK(m.sig_conn_reqs == 3, "no request after the channel is open");
+    }
+    {
+        /* A sink that keeps refusing is not asked for ever. */
+        MockSink m;
+        btc_upper_ops_t ops = plain_upper_ops(&m);
+        m.refuse_audio = 1000;
+        btc_upper_init(&m.src, &ops, 35u, true);
+        btc_upper_start_initiator(&m.src);
+        pump_upper(m);
+        tick_upper(m, 40);
+        CHECK(m.sig_conn_reqs == 1 + (int)BTC_UPPER_AUDIO_RETRIES && !m.ready, "the number of requests is limited");
+        CHECK(btc_upper_audio_refusal(&m.src) == 0x0004u, "and the refusal stays known");
+    }
+    {
+        /* Other refusals do not pass with time: a security block is not asked again. */
+        MockSink m;
+        btc_upper_ops_t ops = plain_upper_ops(&m);
+        m.refuse_audio  = 1000;
+        m.refuse_result = 0x0003u;
+        btc_upper_init(&m.src, &ops, 35u, true);
+        btc_upper_start_initiator(&m.src);
+        pump_upper(m);
+        tick_upper(m, 10);
+        CHECK(m.sig_conn_reqs == 1 && btc_upper_audio_refusal(&m.src) == 0x0003u, "a security refusal is final");
+    }
+    {
+        /* The sink refuses and then opens the channel itself: that channel is used, and no request of ours goes
+         * out next to it. */
+        MockSink m;
+        btc_upper_ops_t ops = plain_upper_ops(&m);
+        m.refuse_audio = 1000;
+        btc_upper_init(&m.src, &ops, 35u, true);
+        btc_upper_start_initiator(&m.src);
+        pump_upper(m);
+        CHECK(m.sig_conn_reqs == 1 && m.to_sink.empty(), "refused, nothing in flight");
+
+        CHECK(peer_opens_channel(m, 0x0019u, 0x0070u, 672u) != 0u, "the source accepts the channel the sink opens");
+        bool discover = false;
+        for (const auto &f : m.to_sink) {
+            if (f.size() == 6u && f[2] == 0x70u && f[3] == 0x00u && (f[4] & 0x03u) == 0u && f[5] == 0x01u) discover = true;
+        }
+        CHECK(discover, "AVDTP discovery goes out on the channel the sink opened");
+        CHECK(btc_upper_audio_refusal(&m.src) == 0u, "the refusal is forgotten with the channel open");
+        m.to_sink.clear();
+        for (int i = 0; i < 8; i++) {
+            btc_upper_on_tick(&m.src);
+        }
+        CHECK(m.to_sink.empty(), "no connection request of ours follows");
+    }
+    return 0;
+}
+
+/* One SDP request of the peer on its channel; returns the source's answer, the SDP PDU without the L2CAP header
+ * (empty when the answer is not exactly one frame on the peer's channel). */
+static std::vector<uint8_t> sdp_ask(MockSink &m, uint16_t our_cid, uint16_t their_cid, uint8_t pdu,
+                                    const std::vector<uint8_t> &params)
+{
+    std::vector<uint8_t> req = { pdu, 0x00u, 0x07u, (uint8_t)(params.size() >> 8), (uint8_t)params.size() };
+    req.insert(req.end(), params.begin(), params.end());
+    m.to_sink.clear();
+    feed_src(m, our_cid, req.data(), (uint16_t)req.size());
+    if (m.to_sink.size() != 1u) {
+        return {};
+    }
+    const std::vector<uint8_t> &f = m.to_sink[0];
+    if (f.size() < 9u || (uint16_t)(f[2] | (f[3] << 8)) != their_cid || f[5] != 0x00u || f[6] != 0x07u ||
+        (size_t)((f[7] << 8) | f[8]) != f.size() - 9u) {
+        return {};
+    }
+    return std::vector<uint8_t>(f.begin() + 4, f.end());
+}
+
+static std::vector<uint8_t> cat(std::initializer_list<std::vector<uint8_t>> parts)
+{
+    std::vector<uint8_t> out;
+    for (const auto &part : parts) {
+        out.insert(out.end(), part.begin(), part.end());
+    }
+    return out;
+}
+
+/* The source's SDP server, as Core Spec Vol 3 Part B asks: the attributes the request names, not more bytes than it
+ * allows (nor than the channel's MTU), the rest on the continuation. Sony WH-1000XM3, 2026-11-15: its SDP channel
+ * has an MTU of 48 and its request allows 32 bytes; the old answer of 68 bytes in one frame was dropped, and the
+ * headphones never opened the audio channel. */
+static int test_sdp_server_answers_within_the_limits_of_the_request(void)
+{
+    /* The two records, attribute by attribute (ID as a 16-bit unsigned integer, then the value). */
+    const std::vector<uint8_t> a_handle   = { 0x09, 0x00, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x01 };
+    const std::vector<uint8_t> a_classes  = { 0x09, 0x00, 0x01, 0x35, 0x03, 0x19, 0x11, 0x0A };
+    const std::vector<uint8_t> a_protocol = { 0x09, 0x00, 0x04, 0x35, 0x10, 0x35, 0x06, 0x19, 0x01, 0x00, 0x09, 0x00,
+                                              0x19, 0x35, 0x06, 0x19, 0x00, 0x19, 0x09, 0x01, 0x03 };
+    const std::vector<uint8_t> a_profile  = { 0x09, 0x00, 0x09, 0x35, 0x08, 0x35, 0x06, 0x19, 0x11, 0x0D, 0x09, 0x01,
+                                              0x03 };
+    const std::vector<uint8_t> a_features = { 0x09, 0x03, 0x11, 0x09, 0x00, 0x01 };
+    const std::vector<uint8_t> a2dp_all =
+        cat({ { 0x35, 56 }, a_handle, a_classes, a_protocol, a_profile, a_features }); /* 58 bytes */
+    const std::vector<uint8_t> r_handle   = { 0x09, 0x00, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x02 };
+    const std::vector<uint8_t> r_classes  = { 0x09, 0x00, 0x01, 0x35, 0x06, 0x19, 0x11, 0x0E, 0x19, 0x11, 0x0C };
+    const std::vector<uint8_t> r_protocol = { 0x09, 0x00, 0x04, 0x35, 0x10, 0x35, 0x06, 0x19, 0x01, 0x00, 0x09, 0x00,
+                                              0x17, 0x35, 0x06, 0x19, 0x00, 0x17, 0x09, 0x01, 0x04 };
+    const std::vector<uint8_t> r_profile  = { 0x09, 0x00, 0x09, 0x35, 0x08, 0x35, 0x06, 0x19, 0x11, 0x0E, 0x09, 0x01,
+                                              0x05 };
+    const std::vector<uint8_t> avrcp_all = cat({ { 0x35, 53 }, r_handle, r_classes, r_protocol, r_profile });
+
+    const std::vector<uint8_t> for_source  = { 0x35, 0x03, 0x19, 0x11, 0x0A }; /* search pattern: AudioSource */
+    const std::vector<uint8_t> every_attr  = { 0x35, 0x05, 0x0A, 0x00, 0x00, 0xFF, 0xFF };
+    const std::vector<uint8_t> profile_only = { 0x35, 0x03, 0x09, 0x00, 0x09 };
+    const std::vector<uint8_t> no_more     = { 0x00 };
+
+    {
+        /* The headphones' channel and request: MTU 48, at most 32 bytes, the profile descriptor list only. */
+        MockSink m;
+        btc_upper_ops_t ops = plain_upper_ops(&m);
+        btc_upper_init(&m.src, &ops, 35u, true);
+        const uint16_t cid = peer_opens_channel(m, 0x0001u, 0x0070u, 48u);
+        CHECK(cid != 0u, "the source accepts an SDP channel of the peer");
+
+        std::vector<uint8_t> rsp =
+            sdp_ask(m, cid, 0x0070u, 0x06u, cat({ for_source, { 0x00, 0x20 }, profile_only, no_more }));
+        const std::vector<uint8_t> want_profile = cat({ { 0x35, 15, 0x35, 13 }, a_profile });
+        CHECK(rsp.size() == 5u + 2u + 17u + 1u && rsp[0] == 0x07u && rsp[5] == 0x00u && rsp[6] == 17u &&
+                  std::equal(want_profile.begin(), want_profile.end(), rsp.begin() + 7) && rsp.back() == 0x00u,
+              "only the attribute that was asked for comes back, in one frame that fits the MTU");
+
+        /* Everything, 32 bytes at a time: two answers, the first with a continuation state. */
+        const std::vector<uint8_t> whole = cat({ { 0x35, 58 }, a2dp_all }); /* 60 bytes */
+        rsp = sdp_ask(m, cid, 0x0070u, 0x06u, cat({ for_source, { 0x00, 0x20 }, every_attr, no_more }));
+        CHECK(rsp.size() == 5u + 2u + 32u + 3u && rsp.size() <= 48u && rsp[6] == 32u, "the first part: 32 bytes");
+        CHECK(std::equal(whole.begin(), whole.begin() + 32, rsp.begin() + 7), "they are the start of the answer");
+        const std::vector<uint8_t> state(rsp.end() - 3, rsp.end());
+        CHECK(state[0] == 0x02u, "followed by a continuation state of two bytes");
+        rsp = sdp_ask(m, cid, 0x0070u, 0x06u, cat({ for_source, { 0x00, 0x20 }, every_attr, state }));
+        CHECK(rsp.size() == 5u + 2u + 28u + 1u && rsp[6] == 28u && rsp.back() == 0x00u &&
+                  std::equal(whole.begin() + 32, whole.end(), rsp.begin() + 7),
+              "the request with that state brings the rest, and the answer ends there");
+
+        /* A request that allows more than the channel carries is limited by the channel. */
+        rsp = sdp_ask(m, cid, 0x0070u, 0x06u, cat({ for_source, { 0x00, 0xFF }, every_attr, no_more }));
+        CHECK(rsp.size() == 48u && rsp[6] == 38u && rsp[rsp.size() - 3u] == 0x02u,
+              "the MTU of the channel limits a part as well");
+
+        /* A continuation state that points past the end. */
+        rsp = sdp_ask(m, cid, 0x0070u, 0x06u, cat({ for_source, { 0x00, 0x20 }, every_attr, { 0x02, 0x01, 0x00 } }));
+        CHECK(rsp == std::vector<uint8_t>({ 0x01, 0x00, 0x07, 0x00, 0x02, 0x00, 0x05 }),
+              "a continuation state that is not ours: error 0x0005");
+        rsp = sdp_ask(m, cid, 0x0070u, 0x06u, cat({ for_source, { 0x00, 0x06 }, every_attr, no_more }));
+        CHECK(rsp == std::vector<uint8_t>({ 0x01, 0x00, 0x07, 0x00, 0x02, 0x00, 0x03 }),
+              "fewer than seven bytes allowed: invalid request syntax");
+    }
+    {
+        /* A roomy channel: whole answers, and the records are well-formed (each sequence as long as it says). */
+        MockSink m;
+        btc_upper_ops_t ops = plain_upper_ops(&m);
+        btc_upper_init(&m.src, &ops, 35u, true);
+        const uint16_t cid = peer_opens_channel(m, 0x0001u, 0x0070u, 672u);
+        CHECK(cid != 0u, "SDP channel with the default MTU");
+
+        std::vector<uint8_t> rsp =
+            sdp_ask(m, cid, 0x0070u, 0x06u, cat({ for_source, { 0xFF, 0xFF }, every_attr, no_more }));
+        CHECK(rsp == cat({ { 0x07, 0x00, 0x07, 0x00, 63, 0x00, 60, 0x35, 58 }, a2dp_all, no_more }),
+              "the whole AudioSource record in one answer");
+
+        /* AVRCP by a 128-bit UUID (0000110E-0000-1000-8000-00805F9B34FB) and two single attribute IDs. */
+        const std::vector<uint8_t> for_avrcp128 = { 0x35, 0x11, 0x1C, 0x00, 0x00, 0x11, 0x0E, 0x00, 0x00, 0x10, 0x00,
+                                                    0x80, 0x00, 0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB };
+        rsp = sdp_ask(m, cid, 0x0070u, 0x06u,
+                      cat({ for_avrcp128, { 0xFF, 0xFF }, { 0x35, 0x06, 0x09, 0x00, 0x01, 0x09, 0x00, 0x09 }, no_more }));
+        CHECK(rsp == cat({ { 0x07, 0x00, 0x07, 0x00, 31, 0x00, 28, 0x35, 26, 0x35, 24 }, r_classes, r_profile, no_more }),
+              "a 128-bit UUID finds the AVRCP record; two single IDs give two attributes");
+
+        /* L2CAP (0x0100) is in both records. */
+        rsp = sdp_ask(m, cid, 0x0070u, 0x06u,
+                      cat({ { 0x35, 0x03, 0x19, 0x01, 0x00 }, { 0xFF, 0xFF }, { 0x35, 0x03, 0x09, 0x00, 0x00 }, no_more }));
+        CHECK(rsp == cat({ { 0x07, 0x00, 0x07, 0x00, 25, 0x00, 22, 0x35, 20, 0x35, 8 }, a_handle, { 0x35, 8 },
+                           r_handle, no_more }),
+              "a pattern both records hold gives both, in the order of their handles");
+
+        /* Serial Port (0x1101) is in none: an empty list, not an error. */
+        rsp = sdp_ask(m, cid, 0x0070u, 0x06u, cat({ { 0x35, 0x03, 0x19, 0x11, 0x01 }, { 0xFF, 0xFF }, every_attr, no_more }));
+        CHECK(rsp == std::vector<uint8_t>({ 0x07, 0x00, 0x07, 0x00, 0x05, 0x00, 0x02, 0x35, 0x00, 0x00 }),
+              "no record matches: an empty list");
+        /* A pattern asks for all of its UUIDs: AudioSource and Serial Port together match nothing. */
+        rsp = sdp_ask(m, cid, 0x0070u, 0x06u,
+                      cat({ { 0x35, 0x06, 0x19, 0x11, 0x0A, 0x19, 0x11, 0x01 }, { 0xFF, 0xFF }, every_attr, no_more }));
+        CHECK(rsp == std::vector<uint8_t>({ 0x07, 0x00, 0x07, 0x00, 0x05, 0x00, 0x02, 0x35, 0x00, 0x00 }),
+              "every UUID of the pattern has to be in the record");
+
+        /* SDP_ServiceSearchRequest: handles; SDP_ServiceAttributeRequest: one record by its handle. */
+        rsp = sdp_ask(m, cid, 0x0070u, 0x02u, cat({ for_source, { 0x00, 0x10 }, no_more }));
+        CHECK(rsp == std::vector<uint8_t>({ 0x03, 0x00, 0x07, 0x00, 0x09, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
+                                            0x01, 0x00 }),
+              "the search alone gives the handle of the AudioSource record");
+        rsp = sdp_ask(m, cid, 0x0070u, 0x02u, cat({ { 0x35, 0x03, 0x19, 0x01, 0x00 }, { 0x00, 0x01 }, no_more }));
+        CHECK(rsp.size() == 14u && rsp[6] == 0x01u && rsp[8] == 0x01u && rsp[12] == 0x01u,
+              "not more handles than the request allows");
+        rsp = sdp_ask(m, cid, 0x0070u, 0x04u, cat({ { 0x00, 0x01, 0x00, 0x02 }, { 0xFF, 0xFF }, every_attr, no_more }));
+        CHECK(rsp == cat({ { 0x05, 0x00, 0x07, 0x00, 58, 0x00, 55 }, avrcp_all, no_more }),
+              "the attributes of the AVRCP record by its handle");
+        rsp = sdp_ask(m, cid, 0x0070u, 0x04u, cat({ { 0x00, 0x01, 0x00, 0x01 }, { 0x00, 0x14 }, every_attr, no_more }));
+        CHECK(rsp.size() == 5u + 2u + 20u + 3u && std::equal(a2dp_all.begin(), a2dp_all.begin() + 20, rsp.begin() + 7),
+              "and in parts when the request allows only so many bytes");
+        rsp = sdp_ask(m, cid, 0x0070u, 0x04u, cat({ { 0x00, 0x01, 0x00, 0x09 }, { 0xFF, 0xFF }, every_attr, no_more }));
+        CHECK(rsp == std::vector<uint8_t>({ 0x01, 0x00, 0x07, 0x00, 0x02, 0x00, 0x02 }), "an unknown handle: error 0x0002");
+        rsp = sdp_ask(m, cid, 0x0070u, 0x06u, { 0x35, 0x09, 0x19 });
+        CHECK(rsp == std::vector<uint8_t>({ 0x01, 0x00, 0x07, 0x00, 0x02, 0x00, 0x03 }), "a cut request: error 0x0003");
+    }
+    return 0;
+}
+
 static int test_bonds_remember_several_devices(void)
 {
     const uint8_t a[6] = {0xA0, 1, 2, 3, 4, 5}, b[6] = {0xB0, 1, 2, 3, 4, 5}, c[6] = {0xC0, 1, 2, 3, 4, 5};
@@ -894,9 +1404,14 @@ int main(void)
     if (test_p192_official_sample_data() != 0) return 1;
     if (test_lmp_ssp_and_legacy() != 0) return 1;
     if (test_lmp_peer_stays_on_one_slot_without_a_loop() != 0) return 1;
+    if (test_lmp_keeps_a_trace_of_the_link() != 0) return 1;
+    if (test_lmp_pairing_request_refused_at_first_is_sent_again() != 0) return 1;
     if (test_media_queue_bridges_a_gap() != 0) return 1;
     if (test_rate_follows_the_link() != 0) return 1;
     if (test_l2cap_avdtp_avrcp() != 0) return 1;
+    if (test_upper_keeps_a_trace_of_the_l2cap_frames() != 0) return 1;
+    if (test_upper_refused_audio_channel_is_asked_for_again() != 0) return 1;
+    if (test_sdp_server_answers_within_the_limits_of_the_request() != 0) return 1;
     if (test_bonds_remember_several_devices() != 0) return 1;
     std::printf("ALL PASS\n");
     return 0;

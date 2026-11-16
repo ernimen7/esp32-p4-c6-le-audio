@@ -16,5 +16,9 @@ set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_LIST_DIR}/../../components/espressif__esp_lvgl_port"
 )
 
+# The version the player logs at start and carries in its image: the release it belongs to (CHANGELOG.md).
+# Without it ESP-IDF would put a description of the working tree there.
+set(PROJECT_VER "0.2.1")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(tab5_player)

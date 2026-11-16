@@ -39,6 +39,16 @@ typedef struct {
     void (*on_peer_max_slots)(void *ctx, uint8_t slots, uint8_t why, uint8_t err);
 } btc_lmp_ops_t;
 
+/* The last PDUs of the link, both ways. With a device nobody has tried the setup can stop with silence on both
+ * sides (Sony WH-1000XM3, 2026-11-15: after about eleven PDUs each way) and the counters do not say at which. */
+#define BTC_LMP_TRACE 64u
+typedef struct {
+    uint8_t dir;  /* 0 sent, 1 received */
+    uint8_t len;  /* length of the PDU */
+    uint8_t tick; /* btc_lmp_on_tick calls since btc_lmp_start, about two a second; stops at 255 */
+    uint8_t d[5]; /* its first bytes: opcode << 1 | TID, then the extended opcode or the first parameters */
+} btc_lmp_rec_t;
+
 typedef struct btc_lmp {
     btc_lmp_ops_t  ops;
     btc_lmp_goal_t goal;
@@ -113,6 +123,11 @@ typedef struct btc_lmp {
 
     uint8_t local_nonce_le[16];
     uint8_t peer_nonce_le[16];
+    /* Our LMP_io_capability_req was refused with "LMP PDU not allowed": it goes out again when this reaches zero
+     * (btc_lmp_on_tick), BTC_LMP_IOCAP_RETRIES times at most. */
+    uint8_t iocap_retry_in;
+    uint8_t iocap_retries;
+
     uint8_t peer_confirm_le[16];
     bool    peer_confirm_rcvd;
     bool    local_nonce_sent;
@@ -121,6 +136,10 @@ typedef struct btc_lmp {
 
     /* Last derived Kc' for inspection/verification */
     uint8_t last_kc_prime[16];
+
+    btc_lmp_rec_t trace[BTC_LMP_TRACE]; /* a ring: record i is trace[i % BTC_LMP_TRACE] */
+    uint16_t      trace_n;              /* PDUs since btc_lmp_start */
+    uint8_t       trace_tick;
 } btc_lmp_t;
 
 void btc_lmp_init(btc_lmp_t *lmp, const btc_lmp_ops_t *ops,
@@ -141,6 +160,10 @@ void btc_lmp_on_encryption_state(btc_lmp_t *lmp, uint8_t status, bool enc_on);
 /* Called about twice a second while the link is up, from the context that calls btc_lmp_on_pdu: answers what
  * was left waiting so that it does not run as fast as the link allows. */
 void btc_lmp_on_tick(btc_lmp_t *lmp);
+
+/* The trace of the link since its btc_lmp_start, oldest record first; returns how many were written to `out`
+ * (at most max_out and BTC_LMP_TRACE). */
+uint8_t btc_lmp_trace_read(const btc_lmp_t *lmp, btc_lmp_rec_t *out, uint8_t max_out);
 
 /* Portable NIST P-192 (secp192r1) ECDH primitives (exposed for deterministic vector tests).
  * Coordinates `pk_x_le`, `pk_y_le`, `priv_d_le`, `out_dhkey_x_le` are 24-byte Bluetooth little-endian. */
