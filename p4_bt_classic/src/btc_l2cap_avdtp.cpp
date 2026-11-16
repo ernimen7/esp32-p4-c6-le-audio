@@ -3,6 +3,7 @@
  */
 #include "btc_l2cap_avdtp.h"
 
+#include <stddef.h>
 #include <string.h>
 
 namespace {
@@ -24,6 +25,12 @@ enum {
     L2CAP_INFO_RSP         = 0x0Bu,
 };
 
+/* Result of an L2CAP connection response: "Connection refused - no resources available" (Core Spec Vol 3 Part A
+ * 4.3). */
+enum {
+    L2CAP_CONN_NO_RESOURCES = 0x0004u,
+};
+
 /* SDP PDU IDs */
 enum {
     SDP_ERROR_RSP                      = 0x01u,
@@ -33,6 +40,13 @@ enum {
     SDP_SERVICE_ATTR_RSP               = 0x05u,
     SDP_SERVICE_SEARCH_ATTR_REQ        = 0x06u,
     SDP_SERVICE_SEARCH_ATTR_RSP        = 0x07u,
+};
+
+/* SDP error codes (Core Spec Vol 3 Part B, SDP_ErrorResponse) */
+enum {
+    SDP_ERR_INVALID_HANDLE       = 0x0002u,
+    SDP_ERR_INVALID_SYNTAX       = 0x0003u,
+    SDP_ERR_INVALID_CONTINUATION = 0x0005u,
 };
 
 /* AVDTP Signal IDs & Message Types */
@@ -101,7 +115,26 @@ static uint8_t next_sig_ident(btc_upper_t *u)
     return u->next_sig_id;
 }
 
-static bool send_l2cap_frame(btc_upper_t *u, uint16_t remote_cid, const uint8_t *payload, uint16_t plen)
+static void trace_put(btc_upper_t *u, uint8_t dir, uint16_t cid, uint16_t len, const uint8_t *payload, uint16_t have)
+{
+    btc_upper_rec_t *r = &u->trace[u->trace_n % BTC_UPPER_TRACE];
+    memset(r, 0, sizeof(*r));
+    r->dir  = dir;
+    r->tick = u->trace_tick;
+    r->cid  = cid;
+    r->len  = len;
+    if (have > 0u && payload != nullptr) {
+        memcpy(r->d, payload, have < sizeof(r->d) ? have : sizeof(r->d));
+    }
+    if (u->trace_n < 0xFFFFu - BTC_UPPER_TRACE) {
+        u->trace_n++;
+    } else {
+        u->trace_n = (uint16_t)(u->trace_n - BTC_UPPER_TRACE + 1u); /* same ring position, no wrap of the count */
+    }
+}
+
+/* Media packets go out through this one, past the trace: fifty a second would leave nothing else in it. */
+static bool send_l2cap_untraced(btc_upper_t *u, uint16_t remote_cid, const uint8_t *payload, uint16_t plen)
 {
     if (!u->ops.send_l2cap_pdu || (uint32_t)plen + 4u > 672u) {
         return false;
@@ -113,6 +146,12 @@ static bool send_l2cap_frame(btc_upper_t *u, uint16_t remote_cid, const uint8_t 
         memcpy(&sdu[4], payload, plen);
     }
     return u->ops.send_l2cap_pdu(u->ops.ctx, sdu, (uint16_t)(4u + plen));
+}
+
+static bool send_l2cap_frame(btc_upper_t *u, uint16_t remote_cid, const uint8_t *payload, uint16_t plen)
+{
+    trace_put(u, 0u, remote_cid, plen, payload, plen);
+    return send_l2cap_untraced(u, remote_cid, payload, plen);
 }
 
 static void send_l2cap_sig(btc_upper_t *u, uint8_t code, uint8_t ident, const uint8_t *data, uint16_t dlen)
@@ -414,6 +453,9 @@ static void on_channel_opened(btc_upper_t *u, btc_l2cap_chan_t *c)
     }
 
     case BTC_CHAN_ROLE_AVDTP_SIG: {
+        /* Ours or the one the peer opened after refusing ours: either way the refusal is over. */
+        u->audio_refusal  = 0u;
+        u->audio_retry_in = 0u;
         if (!u->avdtp_configured) {
             send_avdtp_cmd(u, AVDTP_DISCOVER, nullptr, 0u);
         }
@@ -542,6 +584,15 @@ static void handle_l2cap_signaling(btc_upper_t *u, const uint8_t *p, uint16_t le
             } else {
                 btc_chan_role_t old_role = c->role;
                 c->state = BTC_CHAN_CLOSED;
+                if (old_role == BTC_CHAN_ROLE_AVDTP_SIG) {
+                    /* "No resources" passes: headphones give it while they are busy with their own start or with
+                     * another device (Sony WH-1000XM3, 2026-11-15, after "pending"). The other results do not. */
+                    u->audio_refusal = result;
+                    if (result == L2CAP_CONN_NO_RESOURCES && u->audio_retries < BTC_UPPER_AUDIO_RETRIES) {
+                        u->audio_retries++;
+                        u->audio_retry_in = BTC_UPPER_AUDIO_RETRY_TICKS;
+                    }
+                }
                 on_channel_closed(u, old_role);
             }
             break;
@@ -684,45 +735,278 @@ static void handle_l2cap_signaling(btc_upper_t *u, const uint8_t *p, uint16_t le
     }
 }
 
-/* ==== Minimalist SDP Server & Client (`PSM 0x0001`) ==== */
-/* Complete pre-encoded SDP attribute list for AudioSource (0x110A) + A2DP v1.3 */
-static const uint8_t kSdpAttrAudioSource[] = {
-    0x35, 0x36, /* Sequence (54 bytes) */
-        /* Attr 0x0000: ServiceRecordHandle = 0x00010001 */
-        0x09, 0x00, 0x00,  0x0A, 0x00, 0x01, 0x00, 0x01,
-        /* Attr 0x0001: ServiceClassIDList = { AudioSource (0x110A) } */
-        0x09, 0x00, 0x01,  0x35, 0x03,  0x19, 0x11, 0x0A,
-        /* Attr 0x0004: ProtocolDescriptorList = { {L2CAP, 0x0019}, {AVDTP, 0x0103} } */
-        0x09, 0x00, 0x04,  0x35, 0x10,
-            0x35, 0x06,  0x19, 0x01, 0x00,  0x09, 0x00, 0x19,
-            0x35, 0x06,  0x19, 0x00, 0x19,  0x09, 0x01, 0x03,
-        /* Attr 0x0009: BluetoothProfileDescriptorList = { {A2DP (0x110D), 0x0103} } */
-        0x09, 0x00, 0x09,  0x35, 0x08,
-            0x35, 0x06,  0x19, 0x11, 0x0D,  0x09, 0x01, 0x03,
-        /* Attr 0x0311: SupportedFeatures = 0x0001 (Player) */
-        0x09, 0x03, 0x11,  0x09, 0x00, 0x01,
+/* ==== SDP (`PSM 0x0001`): a client for one question, a server for two records (Core Spec Vol 3 Part B) ==== */
+
+/* One attribute of a service record: its ID and its value, a data element. */
+struct SdpAttr {
+    uint16_t       id;
+    const uint8_t *value;
+    uint8_t        len;
 };
 
-/* Pre-encoded SDP attribute list for AVRCP Controller/Target (0x110E / 0x110C) */
-static const uint8_t kSdpAttrAvrcp[] = {
-    0x35, 0x33, /* Sequence (51 bytes) */
-        0x09, 0x00, 0x00,  0x0A, 0x00, 0x01, 0x00, 0x02,
-        0x09, 0x00, 0x01,  0x35, 0x06,  0x19, 0x11, 0x0E,  0x19, 0x11, 0x0C,
-        0x09, 0x00, 0x04,  0x35, 0x10,
-            0x35, 0x06,  0x19, 0x01, 0x00,  0x09, 0x00, 0x17,
-            0x35, 0x06,  0x19, 0x00, 0x17,  0x09, 0x01, 0x04,
-        0x09, 0x00, 0x09,  0x35, 0x08,
-            0x35, 0x06,  0x19, 0x11, 0x0E,  0x09, 0x01, 0x05,
+struct SdpRecord {
+    uint32_t        handle;
+    const SdpAttr  *attrs;   /* in ascending order of ID, the order they are returned in */
+    uint8_t         n_attrs;
+    const uint16_t *uuids;   /* every UUID in the values: what a service search pattern is matched against */
+    uint8_t         n_uuids;
 };
 
-static bool buf_has_uuid16(const uint8_t *b, uint16_t len, uint16_t uuid)
+/* AudioSource, A2DP 1.3 */
+static const uint8_t kA2dpHandle[]   = { 0x0A, 0x00, 0x01, 0x00, 0x01 };
+static const uint8_t kA2dpClasses[]  = { 0x35, 0x03, 0x19, 0x11, 0x0A };
+static const uint8_t kA2dpProtocol[] = { 0x35, 0x10,
+                                         0x35, 0x06, 0x19, 0x01, 0x00, 0x09, 0x00, 0x19,   /* L2CAP, PSM 0x0019 */
+                                         0x35, 0x06, 0x19, 0x00, 0x19, 0x09, 0x01, 0x03 }; /* AVDTP 1.3 */
+static const uint8_t kA2dpProfile[]  = { 0x35, 0x08, 0x35, 0x06, 0x19, 0x11, 0x0D, 0x09, 0x01, 0x03 };
+static const uint8_t kA2dpFeatures[] = { 0x09, 0x00, 0x01 }; /* Player */
+static const SdpAttr kA2dpAttrs[] = {
+    { 0x0000u, kA2dpHandle, sizeof(kA2dpHandle) },     /* ServiceRecordHandle */
+    { 0x0001u, kA2dpClasses, sizeof(kA2dpClasses) },   /* ServiceClassIDList */
+    { 0x0004u, kA2dpProtocol, sizeof(kA2dpProtocol) }, /* ProtocolDescriptorList */
+    { 0x0009u, kA2dpProfile, sizeof(kA2dpProfile) },   /* BluetoothProfileDescriptorList */
+    { 0x0311u, kA2dpFeatures, sizeof(kA2dpFeatures) }, /* SupportedFeatures */
+};
+static const uint16_t kA2dpUuids[] = { 0x110Au, 0x0100u, 0x0019u, 0x110Du };
+
+/* AVRCP 1.5: A/V Remote Control and its Target */
+static const uint8_t kAvrcpHandle[]   = { 0x0A, 0x00, 0x01, 0x00, 0x02 };
+static const uint8_t kAvrcpClasses[]  = { 0x35, 0x06, 0x19, 0x11, 0x0E, 0x19, 0x11, 0x0C };
+static const uint8_t kAvrcpProtocol[] = { 0x35, 0x10,
+                                          0x35, 0x06, 0x19, 0x01, 0x00, 0x09, 0x00, 0x17,   /* L2CAP, PSM 0x0017 */
+                                          0x35, 0x06, 0x19, 0x00, 0x17, 0x09, 0x01, 0x04 }; /* AVCTP 1.4 */
+static const uint8_t kAvrcpProfile[]  = { 0x35, 0x08, 0x35, 0x06, 0x19, 0x11, 0x0E, 0x09, 0x01, 0x05 };
+static const SdpAttr kAvrcpAttrs[] = {
+    { 0x0000u, kAvrcpHandle, sizeof(kAvrcpHandle) },
+    { 0x0001u, kAvrcpClasses, sizeof(kAvrcpClasses) },
+    { 0x0004u, kAvrcpProtocol, sizeof(kAvrcpProtocol) },
+    { 0x0009u, kAvrcpProfile, sizeof(kAvrcpProfile) },
+};
+static const uint16_t kAvrcpUuids[] = { 0x110Eu, 0x110Cu, 0x0100u, 0x0017u };
+
+static const SdpRecord kSdpRecords[] = {
+    { 0x00010001u, kA2dpAttrs, (uint8_t)(sizeof(kA2dpAttrs) / sizeof(kA2dpAttrs[0])), kA2dpUuids,
+      (uint8_t)(sizeof(kA2dpUuids) / sizeof(kA2dpUuids[0])) },
+    { 0x00010002u, kAvrcpAttrs, (uint8_t)(sizeof(kAvrcpAttrs) / sizeof(kAvrcpAttrs[0])), kAvrcpUuids,
+      (uint8_t)(sizeof(kAvrcpUuids) / sizeof(kAvrcpUuids[0])) },
+};
+#define SDP_RECORD_COUNT (sizeof(kSdpRecords) / sizeof(kSdpRecords[0]))
+
+/* The longest answer: a sequence of both records with every attribute (per attribute three bytes of ID, per
+ * sequence two of header). */
+#define SDP_ANSWER_MAX 128u
+static_assert(2u + (2u + 5u * 3u + sizeof(kA2dpHandle) + sizeof(kA2dpClasses) + sizeof(kA2dpProtocol) +
+                    sizeof(kA2dpProfile) + sizeof(kA2dpFeatures)) +
+                      (2u + 4u * 3u + sizeof(kAvrcpHandle) + sizeof(kAvrcpClasses) + sizeof(kAvrcpProtocol) +
+                       sizeof(kAvrcpProfile)) <= SDP_ANSWER_MAX,
+              "both records fit in an answer");
+
+static uint32_t rd_be32(const uint8_t *p)
 {
-    for (uint16_t i = 0; i + 2u < len; i++) {
-        if (b[i] == 0x19u && rd_be16(&b[i + 1u]) == uuid) {
+    return ((uint32_t)rd_be16(&p[0]) << 16) | rd_be16(&p[2]);
+}
+
+/* The data element sequence that starts at `p`: its contents, and in `used` the length of the whole element. False
+ * when there is no sequence there or it is longer than the `len` bytes that are left. */
+static bool sdp_sequence(const uint8_t *p, uint16_t len, const uint8_t **body, uint16_t *body_len, uint16_t *used)
+{
+    uint32_t n   = 0u;
+    uint16_t hdr = 0u;
+    if (len >= 2u && p[0] == 0x35u) {
+        n   = p[1];
+        hdr = 2u;
+    } else if (len >= 3u && p[0] == 0x36u) {
+        n   = rd_be16(&p[1]);
+        hdr = 3u;
+    } else if (len >= 5u && p[0] == 0x37u) {
+        n   = rd_be32(&p[1]);
+        hdr = 5u;
+    } else {
+        return false;
+    }
+    if (n > (uint32_t)(len - hdr)) {
+        return false;
+    }
+    *body     = &p[hdr];
+    *body_len = (uint16_t)n;
+    *used     = (uint16_t)(hdr + n);
+    return true;
+}
+
+/* The UUID element at `p` (16, 32 or 128 bits): its length, 0 when there is none, and its value as the short form
+ * of the Bluetooth base UUID; a 128-bit UUID that is not built on the base gets a value no record holds. */
+static uint16_t sdp_uuid(const uint8_t *p, uint16_t len, uint32_t *value)
+{
+    static const uint8_t kBaseTail[12] = { 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB };
+    if (len >= 3u && p[0] == 0x19u) {
+        *value = rd_be16(&p[1]);
+        return 3u;
+    }
+    if (len >= 5u && p[0] == 0x1Au) {
+        *value = rd_be32(&p[1]);
+        return 5u;
+    }
+    if (len >= 17u && p[0] == 0x1Cu) {
+        *value = (memcmp(&p[5], kBaseTail, sizeof(kBaseTail)) == 0) ? rd_be32(&p[1]) : 0xFFFFFFFFu;
+        return 17u;
+    }
+    return 0u;
+}
+
+/* A service search pattern is a list of UUIDs, at least one. */
+static bool sdp_pattern_valid(const uint8_t *pattern, uint16_t len)
+{
+    uint16_t pos = 0u;
+    while (pos < len) {
+        uint32_t value = 0u;
+        const uint16_t used = sdp_uuid(&pattern[pos], (uint16_t)(len - pos), &value);
+        if (used == 0u) {
+            return false;
+        }
+        pos = (uint16_t)(pos + used);
+    }
+    return len > 0u;
+}
+
+/* A pattern matches a record that holds every one of its UUIDs, in any attribute and any order (Core Spec Vol 3
+ * Part B, Service Search Patterns). The pattern has passed sdp_pattern_valid. */
+static bool sdp_record_matches(const SdpRecord &r, const uint8_t *pattern, uint16_t len)
+{
+    uint16_t pos = 0u;
+    while (pos < len) {
+        uint32_t value = 0u;
+        pos = (uint16_t)(pos + sdp_uuid(&pattern[pos], (uint16_t)(len - pos), &value));
+        bool held = false;
+        for (uint8_t i = 0; i < r.n_uuids; i++) {
+            held = held || (r.uuids[i] == value);
+        }
+        if (!held) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The element of an attribute ID list at `p`: a 16-bit ID, or a 32-bit range with the first ID in its high half and
+ * the last in its low half. Returns the element's length, 0 when it is neither. */
+static uint16_t sdp_id_range(const uint8_t *p, uint16_t len, uint16_t *first, uint16_t *last)
+{
+    if (len >= 3u && p[0] == 0x09u) {
+        *first = rd_be16(&p[1]);
+        *last  = *first;
+        return 3u;
+    }
+    if (len >= 5u && p[0] == 0x0Au) {
+        *first = rd_be16(&p[1]);
+        *last  = rd_be16(&p[3]);
+        return 5u;
+    }
+    return 0u;
+}
+
+static bool sdp_id_list_valid(const uint8_t *ids, uint16_t len)
+{
+    uint16_t pos = 0u;
+    while (pos < len) {
+        uint16_t first = 0u, last = 0u;
+        const uint16_t used = sdp_id_range(&ids[pos], (uint16_t)(len - pos), &first, &last);
+        if (used == 0u) {
+            return false;
+        }
+        pos = (uint16_t)(pos + used);
+    }
+    return len > 0u;
+}
+
+/* The list has passed sdp_id_list_valid. */
+static bool sdp_id_wanted(const uint8_t *ids, uint16_t len, uint16_t id)
+{
+    uint16_t pos = 0u;
+    while (pos < len) {
+        uint16_t first = 0u, last = 0u;
+        pos = (uint16_t)(pos + sdp_id_range(&ids[pos], (uint16_t)(len - pos), &first, &last));
+        if (id >= first && id <= last) {
             return true;
         }
     }
     return false;
+}
+
+/* The attribute list of one record, with the attributes the request names: a sequence of IDs and values. Returns
+ * its length; SDP_ANSWER_MAX is room for all of it. */
+static uint16_t sdp_put_record(const SdpRecord &r, const uint8_t *ids, uint16_t ids_len, uint8_t *out)
+{
+    uint16_t at = 2u;
+    for (uint8_t i = 0; i < r.n_attrs; i++) {
+        const SdpAttr &a = r.attrs[i];
+        if (!sdp_id_wanted(ids, ids_len, a.id)) {
+            continue;
+        }
+        out[at] = 0x09u;
+        wr_be16(&out[at + 1u], a.id);
+        memcpy(&out[at + 3u], a.value, a.len);
+        at = (uint16_t)(at + 3u + a.len);
+    }
+    out[0] = 0x35u;
+    out[1] = (uint8_t)(at - 2u);
+    return at;
+}
+
+static void sdp_send_error(btc_upper_t *u, const btc_l2cap_chan_t *c, uint16_t tx_id, uint16_t code)
+{
+    uint8_t err[7] = { SDP_ERROR_RSP, 0, 0, 0x00, 0x02, 0, 0 };
+    wr_be16(&err[1], tx_id);
+    wr_be16(&err[5], code);
+    send_l2cap_frame(u, c->remote_cid, err, sizeof(err));
+}
+
+/* One part of an attribute answer. The request's MaximumAttributeByteCount limits the attribute bytes of one
+ * response (Core Spec Vol 3 Part B, SDP_ServiceAttributeRequest and SDP_ServiceSearchAttributeRequest: 7 is its
+ * smallest value), and the PDU has to fit the MTU the peer gave for the channel; what is left
+ * follows when the peer repeats its request with the continuation state of this part, which is the offset of the
+ * next one. Headphones ask in small steps: Sony WH-1000XM3 allows 32 bytes on a channel with an MTU of 48, and an
+ * answer that ignored both was dropped there (2026-11-15). `state` is the request's continuation state, its
+ * length byte first. */
+static void sdp_send_attr_part(btc_upper_t *u, const btc_l2cap_chan_t *c, uint8_t pdu_id, uint16_t tx_id,
+                               const uint8_t *answer, uint16_t total, uint16_t max_bytes, const uint8_t *state,
+                               uint16_t state_len)
+{
+    if (max_bytes < 7u || state_len < 1u || state_len != (uint16_t)(1u + state[0])) {
+        sdp_send_error(u, c, tx_id, SDP_ERR_INVALID_SYNTAX);
+        return;
+    }
+    uint16_t offset = 0u;
+    if (state[0] != 0u) {
+        offset = (state[0] == 2u) ? rd_be16(&state[1]) : 0u;
+        if (offset == 0u || offset >= total) {
+            sdp_send_error(u, c, tx_id, SDP_ERR_INVALID_CONTINUATION);
+            return;
+        }
+    }
+    /* Next to the attribute bytes: PDU header 5, byte count 2, continuation state up to 3. The MTU is 48 or more. */
+    const uint16_t room = (uint16_t)(c->remote_mtu - 10u);
+    uint16_t part = (uint16_t)(total - offset);
+    if (part > max_bytes) {
+        part = max_bytes;
+    }
+    if (part > room) {
+        part = room;
+    }
+    uint8_t rsp[10u + SDP_ANSWER_MAX];
+    rsp[0] = pdu_id;
+    wr_be16(&rsp[1], tx_id);
+    wr_be16(&rsp[5], part);
+    memcpy(&rsp[7], &answer[offset], part);
+    uint16_t at = (uint16_t)(7u + part);
+    if ((uint16_t)(offset + part) < total) {
+        rsp[at] = 0x02u;
+        wr_be16(&rsp[at + 1u], (uint16_t)(offset + part));
+        at = (uint16_t)(at + 3u);
+    } else {
+        rsp[at++] = 0x00u;
+    }
+    wr_be16(&rsp[3], (uint16_t)(at - 5u));
+    send_l2cap_frame(u, c->remote_cid, rsp, at);
 }
 
 static void handle_sdp_pdu(btc_upper_t *u, btc_l2cap_chan_t *c, const uint8_t *p, uint16_t len)
@@ -746,64 +1030,81 @@ static void handle_sdp_pdu(btc_upper_t *u, btc_l2cap_chan_t *c, const uint8_t *p
         return;
     }
 
-    /* SDP Server for incoming speaker queries */
-    bool match_a2dp  = buf_has_uuid16(body, plen, 0x110Au) || buf_has_uuid16(body, plen, 0x110Du) ||
-                       buf_has_uuid16(body, plen, 0x0100u);
-    bool match_avrcp = buf_has_uuid16(body, plen, 0x110Cu) || buf_has_uuid16(body, plen, 0x110Eu) ||
-                       buf_has_uuid16(body, plen, 0x0017u);
+    /* SDP server for the peer's questions about the source. Each request: parameters, then a continuation state. */
+    const uint8_t *pattern = nullptr, *ids = nullptr;
+    uint16_t pattern_len = 0u, ids_len = 0u, used = 0u;
 
     if (pdu_id == SDP_SERVICE_SEARCH_REQ) {
-        uint8_t rsp[32];
-        uint16_t cnt = 0u;
-        uint16_t dpos = 9u;
-        if (match_a2dp)  { wr_be32(&rsp[dpos], 0x00010001u); dpos += 4u; cnt++; }
-        if (match_avrcp) { wr_be32(&rsp[dpos], 0x00010002u); dpos += 4u; cnt++; }
-        rsp[dpos++] = 0x00u; /* ContinuationState = 0 */
+        /* ServiceSearchPattern, MaximumServiceRecordCount, ContinuationState (none: the handles fit one answer) */
+        if (!sdp_sequence(body, plen, &pattern, &pattern_len, &used) || !sdp_pattern_valid(pattern, pattern_len) ||
+            plen != (uint16_t)(used + 3u) || body[used + 2u] != 0u) {
+            sdp_send_error(u, c, tx_id, SDP_ERR_INVALID_SYNTAX);
+            return;
+        }
+        const uint16_t max_count = rd_be16(&body[used]);
+        uint8_t  rsp[5u + 4u + 4u * SDP_RECORD_COUNT + 1u];
+        uint16_t count = 0u;
+        for (size_t i = 0; i < SDP_RECORD_COUNT && count < max_count; i++) {
+            if (sdp_record_matches(kSdpRecords[i], pattern, pattern_len)) {
+                wr_be32(&rsp[9u + 4u * count], kSdpRecords[i].handle);
+                count++;
+            }
+        }
+        const uint16_t at = (uint16_t)(9u + 4u * count);
         rsp[0] = SDP_SERVICE_SEARCH_RSP;
         wr_be16(&rsp[1], tx_id);
-        wr_be16(&rsp[3], (uint16_t)(dpos - 5u));
-        wr_be16(&rsp[5], cnt);
-        wr_be16(&rsp[7], cnt);
-        send_l2cap_frame(u, c->remote_cid, rsp, dpos);
+        wr_be16(&rsp[3], (uint16_t)(at + 1u - 5u));
+        wr_be16(&rsp[5], count); /* TotalServiceRecordCount */
+        wr_be16(&rsp[7], count); /* CurrentServiceRecordCount */
+        rsp[at] = 0x00u;         /* ContinuationState: none */
+        send_l2cap_frame(u, c->remote_cid, rsp, (uint16_t)(at + 1u));
+    } else if (pdu_id == SDP_SERVICE_ATTR_REQ) {
+        /* ServiceRecordHandle, MaximumAttributeByteCount, AttributeIDList, ContinuationState */
+        if (plen < 6u || !sdp_sequence(&body[6], (uint16_t)(plen - 6u), &ids, &ids_len, &used) ||
+            !sdp_id_list_valid(ids, ids_len)) {
+            sdp_send_error(u, c, tx_id, SDP_ERR_INVALID_SYNTAX);
+            return;
+        }
+        const uint32_t handle = rd_be32(&body[0]);
+        const SdpRecord *rec  = nullptr;
+        for (size_t i = 0; i < SDP_RECORD_COUNT; i++) {
+            if (kSdpRecords[i].handle == handle) {
+                rec = &kSdpRecords[i];
+            }
+        }
+        if (rec == nullptr) {
+            sdp_send_error(u, c, tx_id, SDP_ERR_INVALID_HANDLE);
+            return;
+        }
+        uint8_t answer[SDP_ANSWER_MAX];
+        const uint16_t total = sdp_put_record(*rec, ids, ids_len, answer);
+        sdp_send_attr_part(u, c, SDP_SERVICE_ATTR_RSP, tx_id, answer, total, rd_be16(&body[4]), &body[6u + used],
+                           (uint16_t)(plen - 6u - used));
     } else if (pdu_id == SDP_SERVICE_SEARCH_ATTR_REQ) {
-        uint8_t rsp[160];
-        uint8_t list_buf[128];
-        uint16_t lpos = 0u;
-        if (match_a2dp) {
-            memcpy(&list_buf[lpos], kSdpAttrAudioSource, sizeof(kSdpAttrAudioSource));
-            lpos = (uint16_t)(lpos + sizeof(kSdpAttrAudioSource));
+        /* ServiceSearchPattern, MaximumAttributeByteCount, AttributeIDList, ContinuationState */
+        uint16_t ids_used = 0u;
+        if (!sdp_sequence(body, plen, &pattern, &pattern_len, &used) || !sdp_pattern_valid(pattern, pattern_len) ||
+            plen < (uint16_t)(used + 2u) ||
+            !sdp_sequence(&body[used + 2u], (uint16_t)(plen - used - 2u), &ids, &ids_len, &ids_used) ||
+            !sdp_id_list_valid(ids, ids_len)) {
+            sdp_send_error(u, c, tx_id, SDP_ERR_INVALID_SYNTAX);
+            return;
         }
-        if (match_avrcp) {
-            memcpy(&list_buf[lpos], kSdpAttrAvrcp, sizeof(kSdpAttrAvrcp));
-            lpos = (uint16_t)(lpos + sizeof(kSdpAttrAvrcp));
+        /* One attribute list per matching record, in a sequence; none match: an empty sequence. */
+        uint8_t  answer[SDP_ANSWER_MAX];
+        uint16_t total = 2u;
+        for (size_t i = 0; i < SDP_RECORD_COUNT; i++) {
+            if (sdp_record_matches(kSdpRecords[i], pattern, pattern_len)) {
+                total = (uint16_t)(total + sdp_put_record(kSdpRecords[i], ids, ids_len, &answer[total]));
+            }
         }
-        uint16_t seq_total = (uint16_t)(2u + lpos);
-        rsp[0] = SDP_SERVICE_SEARCH_ATTR_RSP;
-        wr_be16(&rsp[1], tx_id);
-        wr_be16(&rsp[3], (uint16_t)(2u + seq_total + 1u));
-        wr_be16(&rsp[5], seq_total);
-        rsp[7] = 0x35u;
-        rsp[8] = (uint8_t)lpos;
-        if (lpos > 0u) {
-            memcpy(&rsp[9], list_buf, lpos);
-        }
-        rsp[9 + lpos] = 0x00u; /* ContinuationState = 0 */
-        send_l2cap_frame(u, c->remote_cid, rsp, (uint16_t)(10u + lpos));
-    } else if (pdu_id == SDP_SERVICE_ATTR_REQ && plen >= 4u) {
-        uint32_t handle = ((uint32_t)rd_be16(&body[0]) << 16) | rd_be16(&body[2]);
-        const uint8_t *rec = (handle == 0x00010002u) ? kSdpAttrAvrcp : kSdpAttrAudioSource;
-        uint16_t rlen = (handle == 0x00010002u) ? (uint16_t)sizeof(kSdpAttrAvrcp) : (uint16_t)sizeof(kSdpAttrAudioSource);
-        uint8_t rsp[96];
-        rsp[0] = SDP_SERVICE_ATTR_RSP;
-        wr_be16(&rsp[1], tx_id);
-        wr_be16(&rsp[3], (uint16_t)(2u + rlen + 1u));
-        wr_be16(&rsp[5], rlen);
-        memcpy(&rsp[7], rec, rlen);
-        rsp[7 + rlen] = 0x00u;
-        send_l2cap_frame(u, c->remote_cid, rsp, (uint16_t)(8u + rlen));
+        answer[0] = 0x35u;
+        answer[1] = (uint8_t)(total - 2u);
+        const uint16_t state_at = (uint16_t)(used + 2u + ids_used);
+        sdp_send_attr_part(u, c, SDP_SERVICE_SEARCH_ATTR_RSP, tx_id, answer, total, rd_be16(&body[used]),
+                           &body[state_at], (uint16_t)(plen - state_at));
     } else {
-        uint8_t err[7] = { SDP_ERROR_RSP, p[1], p[2], 0x00, 0x02, 0x00, 0x03 };
-        send_l2cap_frame(u, c->remote_cid, err, sizeof(err));
+        sdp_send_error(u, c, tx_id, SDP_ERR_INVALID_SYNTAX);
     }
 }
 
@@ -1139,12 +1440,55 @@ extern "C" void btc_upper_reset(btc_upper_t *u)
     uint8_t bp = u->preferred_bitpool;
     bool p44   = u->prefer_44k1;
     uint8_t v7 = u->current_vol_7bit;
-    memset(u, 0, sizeof(*u));
+    /* Everything but the trace, which is read after the link has ended and is the struct's tail. */
+    memset(u, 0, offsetof(btc_upper_t, trace));
     u->ops               = saved_ops;
     u->preferred_bitpool = bp;
     u->prefer_44k1       = p44;
     u->rtp_ssrc          = 0x43594252u;
     u->current_vol_7bit  = v7;
+}
+
+extern "C" void btc_upper_trace_clear(btc_upper_t *u)
+{
+    if (!u) {
+        return;
+    }
+    memset(u->trace, 0, sizeof(u->trace));
+    u->trace_n    = 0u;
+    u->trace_tick = 0u;
+}
+
+extern "C" void btc_upper_on_tick(btc_upper_t *u)
+{
+    if (!u) {
+        return;
+    }
+    if (u->trace_tick < 0xFFu) {
+        u->trace_tick++;
+    }
+    if (u->audio_retry_in != 0u && --u->audio_retry_in == 0u && !find_chan_by_role(u, BTC_CHAN_ROLE_AVDTP_SIG)) {
+        open_outgoing_chan(u, BTC_L2CAP_PSM_AVDTP, BTC_CHAN_ROLE_AVDTP_SIG);
+    }
+}
+
+extern "C" uint16_t btc_upper_audio_refusal(const btc_upper_t *u)
+{
+    return u ? u->audio_refusal : 0u;
+}
+
+extern "C" uint8_t btc_upper_trace_read(const btc_upper_t *u, btc_upper_rec_t *out, uint8_t max_out)
+{
+    if (!u || !out) {
+        return 0u;
+    }
+    const uint16_t kept  = u->trace_n < BTC_UPPER_TRACE ? u->trace_n : (uint16_t)BTC_UPPER_TRACE;
+    const uint16_t first = (uint16_t)(u->trace_n - kept);
+    const uint8_t  n     = kept < max_out ? (uint8_t)kept : max_out;
+    for (uint8_t i = 0; i < n; i++) {
+        out[i] = u->trace[(first + i) % BTC_UPPER_TRACE];
+    }
+    return n;
 }
 
 extern "C" void btc_upper_start_initiator(btc_upper_t *u)
@@ -1165,9 +1509,11 @@ extern "C" void btc_upper_on_l2cap_pdu(btc_upper_t *u, const uint8_t *sdu, uint1
     uint16_t plen = rd_le16(&sdu[0]);
     uint16_t lcid = rd_le16(&sdu[2]);
     if (4u + plen > sdu_len) {
+        trace_put(u, 2u, lcid, plen, &sdu[4], (uint16_t)(sdu_len - 4u));
         return;
     }
     const uint8_t *payload = &sdu[4];
+    trace_put(u, 1u, lcid, plen, payload, plen);
 
     if (lcid == L2CAP_CID_SIGNALING) {
         handle_l2cap_signaling(u, payload, plen);
@@ -1263,7 +1609,7 @@ extern "C" bool btc_upper_send_media_packet(btc_upper_t *u, const uint8_t *sbc_f
 
     /* The numbers move on only with a packet that went out: one that found no room is offered again
      * (btc_media_queue.h) and must not look like several lost packets to the receiver. */
-    if (!send_l2cap_frame(u, med->remote_cid, pkt, plen)) {
+    if (!send_l2cap_untraced(u, med->remote_cid, pkt, plen)) {
         return false;
     }
     u->rtp_seq++;

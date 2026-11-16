@@ -31,18 +31,18 @@ everything needed to build it into your own device.
 - C6 firmware update from your P4 firmware over SDIO: no USB-UART adapter needed on boards like the Tab5.
 - **Bluetooth Classic A2DP (experimental).** Inquiry, pairing (Secure Simple Pairing, or a PIN for old devices),
   encryption, SDP, AVDTP and an SBC stream at 44.1 kHz, through the same C6 firmware and with Wi-Fi left on. The
-  bitpool follows the link: 20 to 25 with the tested speaker (about 146 to 174 kbit/s). Up to four devices are
-  remembered and reconnect with their saved key. Measured at home: 6 minutes of music, 0 of 21 554 media packets
-  lost.
+  bitpool follows the link: 20 to 25 with the tested speaker (about 146 to 174 kbit/s), up to 34 with the tested
+  headphones. Up to four devices are remembered and reconnect with their saved key. Measured at home: 6 minutes of
+  music, 0 of 21 554 media packets lost.
 - A ready-to-flash demo for the M5Stack Tab5: MP3 from the SD card, touch screen, one device list for LE Audio and
   Classic with the remembered devices on top, C6 installer.
 
 ## Quick test on an M5Stack Tab5
 
 The demo player ([`examples/tab5_player`](examples/tab5_player)) plays MP3 files from the SD card to your earbuds
-or your speaker. You need LE Audio earbuds or a Bluetooth Classic speaker (tested: Samsung Galaxy Buds3 Pro and one
-portable speaker; [reports for other devices](#tested-devices) are welcome), a microSD card (FAT32 or exFAT), a
-USB-C cable and Python with `esptool` (`pip install esptool`).
+or your speaker. You need LE Audio earbuds or a Bluetooth Classic speaker or headphones (tested: Samsung Galaxy
+Buds3 Pro, one portable speaker and Sony WH-1000XM3; [reports for other devices](#tested-devices) are welcome), a
+microSD card (FAT32 or exFAT), a USB-C cable and Python with `esptool` (`pip install esptool`).
 
 1. Copy your music into a folder named `music` at the root of the card and insert the card into the Tab5. Only
    MP3 files are played (any bitrate and sample rate, mono or stereo); other files are skipped. Subfolders are
@@ -98,15 +98,22 @@ against your project and adapt it, and what not to do with the C6.
 Bluetooth Classic (experimental):
 
 - It is basic rate only, in software, on a radio built for BLE; it is not a qualified BR/EDR implementation, and it
-  has been used with one speaker for a few days. Expect devices that do not work.
+  has been used with one speaker and one pair of headphones for a few days. Expect devices that do not work, and
+  see [docs/integration.md](docs/integration.md#when-a-classic-device-does-not-connect) for how to find out why.
+- A device that another phone or computer holds does not connect: it refuses the audio channel (reported as such,
+  `ESP_ERR_NOT_ALLOWED`), or it stops accepting data after the link is up, or it does not answer at all (both look
+  like a device that is switched off). Disconnect it from the other device first.
+- Dual-mode headphones can show up twice in a scan: their BLE side (the tested Sony headphones as
+  `LE_WH-1000XM3`) has no LE Audio and gives no sound; choose the Classic entry. Seen in the firmware this project
+  was extracted from; the demo's list has not been checked for it.
 - One audio device at a time. The two host components do not guard each other: your application must disconnect
   the LE device before it scans for or connects a Classic one, as the demo's connection manager does. Up to C6
   firmware 1.5.2 a Classic command after LE connection activity restarted the C6 (and the P4's SDIO driver then
   the board); 1.5.4 removes the cause that was found, but a Classic page while an LE connection is up has not
   been tried on it.
 - No EDR, so SBC stays at a modest bitpool (25 at most with the tested speaker, which also stops answering for
-  about 50 ms several times a second). A2DP source and AVRCP only: no microphone, no hands-free profile, no AAC or
-  aptX.
+  about 50 ms several times a second; 34 with the tested headphones). A2DP source and AVRCP only: no microphone, no
+  hands-free profile, no AAC or aptX.
 - A remembered Classic device is connected on request, not in the background.
 
 ## How it works
@@ -263,9 +270,14 @@ bt_classic_get_diag(&diag);                           // bitpool, link load, pac
 - Bluetooth Classic, C6 firmware 1.5.4, in the firmware this project was extracted from: pairing, reconnecting with
   the saved key, music with Wi-Fi on (bitpool 20 to 25; 0 of 16 174 media packets lost in 4 minutes, and 0 of
   21 554 in 6 minutes with 1.5.1), pause and resume, volume. The LE Audio earbuds and the Classic speaker are
-  both in use with that one C6 image. Not verified yet: the speaker's own buttons (AVRCP), any second Classic
-  device.
-- The Tab5 demo of this release, tried on the Tab5: start, scanning (LE and Classic), the speaker over Classic
+  both in use with that one C6 image. Not verified yet: the speaker's own buttons (AVRCP).
+- 0.2.1, Sony WH-1000XM3 headphones over Classic, in the firmware this project was extracted from (the same host
+  components, C6 1.5.4): pairing (on the build that had the pairing fix alone), connecting with the saved key in
+  about 5 s, AVRCP with absolute volume, 45 s of music with 0 of 2 462 media packets lost and the bitpool going
+  from 20 to 34, and connecting from the device list by hand. While a laptop held the headphones, four attempts
+  failed in the three ways the known limitations describe. Not verified: the headphones' buttons, pairing from
+  scratch on the final build, a long session. The Tab5 demo of 0.2.1 is built in CI and was not run on the Tab5.
+- The Tab5 demo of 0.2.0, tried on the Tab5: start, scanning (LE and Classic), the speaker over Classic
   (connect, encrypted stream, disconnect) and the earbuds over LE Audio (stereo on both). Not verified in the
   demo: switching from one device to the other while one is connected, forgetting a device, saving a new pairing
   (the trial build kept the bond store read-only), and more than a few seconds of music on the speaker.
@@ -278,6 +290,7 @@ bt_classic_get_diag(&diag);                           // bitpool, link load, pac
 |---|---|---|---|
 | Samsung Galaxy Buds3 Pro | LE Audio, 2 × CIS, stereo | Working | L/R in sync, reconnect from saved keys, gestures |
 | X8 Pro (portable speaker) | Classic, A2DP SBC 44.1 kHz | Working | bitpool 20 to 25, reconnect from the saved key, pause and resume |
+| Sony WH-1000XM3 (headphones) | Classic, A2DP SBC 44.1 kHz | Working from 0.2.1 | bitpool 20 to 34, reconnect from the saved key; refuses while another device holds it |
 | Your earbuds or speaker | | ? | [Open a test report](.github/ISSUE_TEMPLATE/earbud-report.md) |
 
 ## Background

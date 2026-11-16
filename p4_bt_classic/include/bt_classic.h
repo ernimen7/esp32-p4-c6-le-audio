@@ -24,6 +24,7 @@ typedef int esp_err_t;
 #define ESP_ERR_NOT_FOUND       0x105
 #define ESP_ERR_NOT_SUPPORTED   0x106
 #define ESP_ERR_TIMEOUT         0x107
+#define ESP_ERR_NOT_ALLOWED     0x10D
 #endif
 #endif
 
@@ -131,7 +132,12 @@ bool bt_classic_c6_supported(void);
  * Returns number of discovered devices written to `out[0..max_out-1]`, or < 0 on error. */
 int bt_classic_scan(bt_classic_device_t *out, int max_out, uint32_t duration_ms, bool resolve_names);
 
-/* Connects to a user-selected Classic speaker/headphones from `bt_classic_scan()`. */
+/* Connects to a user-selected Classic speaker/headphones from `bt_classic_scan()`; returns when the audio channel
+ * is open or the attempt has failed (up to about 30 s). ESP_ERR_TIMEOUT: no answer to the page, or the setup did
+ * not finish in its 12 s. ESP_ERR_NOT_ALLOWED: the device answered and refused the audio channel - headphones do
+ * that while another phone or computer holds them. ESP_FAIL: pairing or authentication failed, or the link was
+ * lost. ESP_ERR_NOT_SUPPORTED: the C6 firmware has no Soft-BR. After a failure bt_classic_lmp_trace_text and
+ * bt_classic_l2cap_trace_text show how far the setup got. */
 esp_err_t bt_classic_connect_device(const bt_classic_device_t *dev);
 esp_err_t bt_classic_connect_addr(const uint8_t addr[6], uint16_t clock_offset, uint8_t page_scan_rep);
 
@@ -203,6 +209,20 @@ typedef struct {
     uint8_t  rate_up_pct, rate_down_pct; /* bt_classic_set_link_limits */
 } bt_classic_diag_t;
 void bt_classic_get_diag(bt_classic_diag_t *out);
+
+/* The LMP messages of the current or the last link, oldest first, as text for a log or a diagnostic page (about
+ * 1.4 kB when full): one item per
+ * message, "S" sent or "R" received, the tick of its moment (about two a second), the first five bytes in hex
+ * (opcode << 1 | TID first) and the length, e.g. "S0:4e01020304/9 R1:0b..". For a device whose connection setup
+ * stops: the counters do not say at which message. Returns the characters written (without the final zero). */
+size_t bt_classic_lmp_trace_text(char *out, size_t size);
+
+/* The same for the L2CAP frames of the link (signalling, SDP, AVDTP, AVRCP; media packets left out): one item per
+ * frame, "S" sent, "R" received or "X" received but cut short and dropped, the tick, the channel the frame was
+ * addressed to, up to 24 payload bytes in hex and the payload length, e.g. "S0:0001:0201040001004000/8" (about
+ * 4.2 kB when full). Neither trace holds a device address; the first characters of the device's name can show
+ * in them. */
+size_t bt_classic_l2cap_trace_text(char *out, size_t size);
 
 /* How much of the link the stream may fill: the bitpool goes up a step while the load it would bring stays under
  * `up_pct` and down a step above `down_pct` (defaults 85 and 95, btc_rate.h). Lower limits leave the radio time

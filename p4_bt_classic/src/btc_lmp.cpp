@@ -482,8 +482,29 @@ static uint8_t my_init_tid(const btc_lmp_t *lmp)
     return lmp->is_slave_sim ? 1u : 0u;
 }
 
+/* A pairing request the peer refused as "not allowed" is sent again after this many ticks (about a second), this
+ * many times. */
+#define BTC_LMP_IOCAP_RETRY_TICKS 2u
+#define BTC_LMP_IOCAP_RETRIES     3u
+
+static void trace_put(btc_lmp_t *lmp, uint8_t dir, const uint8_t *pdu, uint8_t len)
+{
+    btc_lmp_rec_t *r = &lmp->trace[lmp->trace_n % BTC_LMP_TRACE];
+    memset(r, 0, sizeof(*r));
+    r->dir  = dir;
+    r->len  = len;
+    r->tick = lmp->trace_tick;
+    memcpy(r->d, pdu, len < sizeof(r->d) ? len : sizeof(r->d));
+    if (lmp->trace_n < 0xFFFFu - BTC_LMP_TRACE) {
+        lmp->trace_n++;
+    } else {
+        lmp->trace_n = (uint16_t)(lmp->trace_n - BTC_LMP_TRACE + 1u); /* same ring position, no wrap of the count */
+    }
+}
+
 static void tx_pdu(btc_lmp_t *lmp, const uint8_t *pdu, uint8_t len)
 {
+    trace_put(lmp, 0u, pdu, len);
     if (lmp->ops.send_lmp) {
         lmp->ops.send_lmp(lmp->ops.ctx, pdu, len);
     }
@@ -860,7 +881,16 @@ extern "C" void btc_lmp_on_encryption_state(btc_lmp_t *lmp, uint8_t status, bool
  * under which the speaker kept to 1-slot packets, goes out at the pace of this tick. */
 extern "C" void btc_lmp_on_tick(btc_lmp_t *lmp)
 {
-    if (!lmp || !lmp->peer_slot_req_waiting) {
+    if (!lmp) {
+        return;
+    }
+    if (lmp->trace_tick < 0xFFu) {
+        lmp->trace_tick++;
+    }
+    if (lmp->iocap_retry_in != 0u && --lmp->iocap_retry_in == 0u && !lmp->setup_finished) {
+        start_ssp_pairing(lmp);
+    }
+    if (!lmp->peer_slot_req_waiting) {
         return;
     }
     lmp->peer_slot_req_waiting = false;
@@ -868,11 +898,26 @@ extern "C" void btc_lmp_on_tick(btc_lmp_t *lmp)
     tx_max_slot_1(lmp);
 }
 
+extern "C" uint8_t btc_lmp_trace_read(const btc_lmp_t *lmp, btc_lmp_rec_t *out, uint8_t max_out)
+{
+    if (!lmp || !out) {
+        return 0u;
+    }
+    const uint16_t kept  = lmp->trace_n < BTC_LMP_TRACE ? lmp->trace_n : (uint16_t)BTC_LMP_TRACE;
+    const uint16_t first = (uint16_t)(lmp->trace_n - kept);
+    const uint8_t  n     = kept < max_out ? (uint8_t)kept : max_out;
+    for (uint8_t i = 0; i < n; i++) {
+        out[i] = lmp->trace[(first + i) % BTC_LMP_TRACE];
+    }
+    return n;
+}
+
 extern "C" void btc_lmp_on_pdu(btc_lmp_t *lmp, const uint8_t *pdu, uint8_t len)
 {
     if (!lmp || !pdu || len == 0u) {
         return;
     }
+    trace_put(lmp, 1u, pdu, len);
 
     uint8_t tid = pdu[0] & 1u;
     uint8_t opcode = (uint8_t)(pdu[0] >> 1);
@@ -976,8 +1021,26 @@ extern "C" void btc_lmp_on_pdu(btc_lmp_t *lmp, const uint8_t *pdu, uint8_t len)
             break;
         }
         case LMP_EXT_ACCEPTED:
-        case LMP_EXT_NOT_ACCEPTED:
             break;
+        case LMP_EXT_NOT_ACCEPTED: {
+            /* [escape | TID][not_accepted_ext][escape opcode][extended opcode][error]. Only a refusal of our pairing
+             * request matters here; it used to be dropped, and the setup then waited for a peer that had nothing
+             * more to say until the host gave up.
+             * Sony WH-1000XM3 (2026-11-15): error 0x24, LMP PDU not allowed, to the request sent right after
+             * LMP_host_connection_req was accepted - before the headphones had asked for our features, which they
+             * do after LMP_setup_complete. So that one is sent again a little later; any other reason (0x18: the
+             * peer does not allow pairing now) ends the setup with it. */
+            if (len >= 5u && pdu[3] == LMP_EXT_IO_CAPABILITY_REQ && lmp->ssp_active && lmp->ssp_we_initiated &&
+                !lmp->local_pk_sent && !lmp->setup_finished) {
+                if (pdu[4] == 0x24u && lmp->iocap_retries < BTC_LMP_IOCAP_RETRIES) {
+                    lmp->iocap_retries++;
+                    lmp->iocap_retry_in = BTC_LMP_IOCAP_RETRY_TICKS;
+                } else {
+                    finish_setup(lmp, false, pdu[4]);
+                }
+            }
+            break;
+        }
         default:
             tx_not_accepted_ext(lmp, LMP_ESCAPE_4, ext_op, 0x1Au, tid);
             break;

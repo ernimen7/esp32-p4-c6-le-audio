@@ -158,6 +158,24 @@ When the sound stutters, read `bt_classic_get_diag`: `tx_size_level` (0 = 3-slot
 is too slow for the stream), `size_strikes`, `tx_flushes`, `bitpool`, `link_busy_pct`, `media_lost`. The bitpool
 follows the link load by itself (`bt_classic_set_link_limits`).
 
+### When a Classic device does not connect
+
+`bt_classic_connect_*` tell three failures apart: `ESP_ERR_TIMEOUT` (no answer to the page, or the setup did not
+finish in its 12 s), `ESP_ERR_NOT_ALLOWED` (the device answered and refused the audio channel - headphones do that
+while another phone or computer holds them; tell the user to disconnect them there) and `ESP_FAIL` (pairing or
+authentication failed, or the link was lost).
+
+For everything else the host keeps the conversation of the current or the last link:
+`bt_classic_lmp_trace_text()` (the last 64 LMP messages: direction, a tick of about half a second, the first five
+bytes, the length) and `bt_classic_l2cap_trace_text()` (the last 64 L2CAP frames of signalling, SDP, AVDTP and
+AVRCP: direction, tick, channel, up to 24 payload bytes, the length; media packets are left out). Read them after
+the failed call and put them in your log or on a diagnostic page; the demo logs them
+([`examples/tab5_player/main/devices.cpp`](../examples/tab5_player/main/devices.cpp), `logClassicFailure`). The
+last message the device answered, or the result it refused with, is usually the whole diagnosis: the three fixes
+of 0.2.1 were a refused `LMP_io_capability_req`, an SDP request for 32 bytes that got 68, and an L2CAP connection
+response "no resources". A buffer of 1.5 kB holds the LMP text and one of 4.4 kB the L2CAP text. Neither holds a
+device address; the first characters of the device's name can show.
+
 **Crash fuse and black box of the C6.** Two crashes of the C6 while its Classic layer works switch that layer off
 until the next start (LE Audio and Wi-Fi go on; `bt_classic_c6_supported()` then returns false), and the record is
 forgotten after three minutes without a crash. After any crash the C6 keeps what its panic left - reason, task,
@@ -169,5 +187,6 @@ way the firmware this project was extracted from does) can be read with
 `python tools/br_selftest.py HOST --box`. If your device restarts when a Classic call starts, that record is the
 first thing to read and to attach to a bug report.
 
-What it is not: basic rate only (no EDR), SBC only, source only, one device, and tested with one speaker - see the
+What it is not: basic rate only (no EDR), SBC only, source only, one device, and tested with one speaker and one
+pair of headphones - see the
 known limitations in the [README](../README.md#known-limitations).
